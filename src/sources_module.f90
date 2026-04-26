@@ -317,7 +317,6 @@ subroutine sources_partial_cleanup()
   if(allocated(sources_align_mu)) deallocate(sources_align_mu)
   if(allocated(sources_align_orth)) deallocate(sources_align_orth)
   if(allocated(sources_align_para)) deallocate(sources_align_para)
-  if(allocated(sources_stellarsrc_templates)) deallocate(sources_stellarsrc_templates)
 end subroutine sources_partial_cleanup
 
 !-------------------------------------------------------------------
@@ -707,6 +706,9 @@ subroutine sources_get_src_alp(inu0,inu1,nf,src,alp,inclstokes)
   double precision :: rlen,cosp,sinp,cost,sint,vx,vy,vz
   double precision :: velgrad,turb
   double precision :: levent,phievent
+  double precision :: dustdens_local(1:dust_nr_species)
+  double precision :: dusttemp_local(1:dust_nr_species)
+  double precision :: alpha_a,alpha_s
   integer :: iphievent
   logical :: inclstokes
   !
@@ -714,11 +716,11 @@ subroutine sources_get_src_alp(inu0,inu1,nf,src,alp,inclstokes)
   !
   if(rt_incl_dust) then
      if(ray_index.ge.1) then
-        sources_dustdens(:) = dustdens(:,ray_index)
-        sources_dusttemp(:) = dusttemp(:,ray_index)
+        dustdens_local(:) = dustdens(:,ray_index)
+        dusttemp_local(:) = dusttemp(:,ray_index)
      else
-        sources_dustdens(:) = 0.d0
-        sources_dusttemp(:) = 1.d0
+        dustdens_local(:) = 0.d0
+        dusttemp_local(:) = 1.d0
      endif
   endif
   !
@@ -1003,32 +1005,27 @@ subroutine sources_get_src_alp(inu0,inu1,nf,src,alp,inclstokes)
      !    with properly in the other parts of the code. 
      !
      if(rt_incl_dust) then
-        do inu=inu0,inu1
-           if(alignment_mode.eq.0) then
-              !
-              ! Find the the dust continuum extinction coefficients
-              !
-              do ispec=1,dust_nr_species
-                 sources_alpha_a(ispec) = sources_dustdens(ispec) * sources_dustkappa_a(inu,ispec)
-                 sources_alpha_s(ispec) = sources_dustdens(ispec) * sources_dustkappa_s(inu,ispec)
-                 alp(inu) = alp(inu) + sources_alpha_a(ispec) + sources_alpha_s(ispec)
-              enddo
-              ! 
-              ! The source function. First the thermal part.
-              !
-              do ispec=1,dust_nr_species
-                 src(inu,1) = src(inu,1) + sources_alpha_a(ispec) *                       &
-                      bplanck(sources_dusttemp(ispec),sources_frequencies(inu))
-              enddo
-           else
-              !
-              ! For alignment mode: only do scattering part of angle-averaged opacity
-              !
-              do ispec=1,dust_nr_species
-                 sources_alpha_s(ispec) = sources_dustdens(ispec) * sources_dustkappa_s(inu,ispec)
-                 alp(inu) = alp(inu) + sources_alpha_s(ispec)
-              enddo
-           endif
+       do inu=inu0,inu1
+          if(alignment_mode.eq.0) then
+             !
+             ! Find the the dust continuum extinction coefficients
+             !
+             do ispec=1,dust_nr_species
+                alpha_a = dustdens_local(ispec) * sources_dustkappa_a(inu,ispec)
+                alpha_s = dustdens_local(ispec) * sources_dustkappa_s(inu,ispec)
+                alp(inu) = alp(inu) + alpha_a + alpha_s
+                src(inu,1) = src(inu,1) + alpha_a *                                     &
+                     bplanck(dusttemp_local(ispec),sources_frequencies(inu))
+             enddo
+          else
+             !
+             ! For alignment mode: only do scattering part of angle-averaged opacity
+             !
+             do ispec=1,dust_nr_species
+                alpha_s = dustdens_local(ispec) * sources_dustkappa_s(inu,ispec)
+                alp(inu) = alp(inu) + alpha_s
+             enddo
+          endif
            !
            ! Then the scattering part; this part also should be done for aligned grains
            !

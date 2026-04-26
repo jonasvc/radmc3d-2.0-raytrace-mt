@@ -1247,14 +1247,14 @@ end subroutine amrray_find_subcell
 subroutine amrray_find_next_location_cart(ray_dsend,                 &
                 ray_cart_x,ray_cart_y,ray_cart_z,                    &
                 ray_cart_dirx,ray_cart_diry,ray_cart_dirz,           &
-                ray_indexcurr,ray_indexnext,ray_ds,arrived,          &
+                ray_indexcurr,ray_indexnext,ray_ds,arrived,ierror,   &
                 distmin,levelnext)
 implicit none
 doubleprecision :: ray_cart_x,ray_cart_y,ray_cart_z
 doubleprecision :: ray_cart_dirx,ray_cart_diry,ray_cart_dirz
 doubleprecision :: ray_dsend,ray_ds,dsa,dsb
 doubleprecision, optional :: distmin
-integer :: ray_indexcurr,ray_indexnext
+integer :: ray_indexcurr,ray_indexnext,ierror
 integer,optional :: levelnext
 
 doubleprecision :: fact,xt,yt,zt,dummy,dsx,dsy,dsz,rr,ds_sphere,ds_sphere0
@@ -1270,6 +1270,7 @@ if(present(distmin)) distmin = 0.d0    ! Means: default = no fast subcell motion
 amrray_ispherehit = 0
 ds_sphere0 = 1d99
 amrray_icross = 0
+ierror = 0
 !
 ! If cell index = 0, then go look for the cell, else simply link to the cell
 !
@@ -2121,7 +2122,9 @@ if(amrray_selfcheck) then
       write(stdo,*) ray_cart_x,ray_cart_y,ray_cart_z
       if(amr_tree_present) write(stdo,*) associated(amrray_cell),amrray_cell%id
       write(stdo,*) axi
-      stop 1031
+      ierror = 1
+      return
+      !stop 1031
    endif
 endif
 !
@@ -2210,7 +2213,9 @@ endif
 if(amrray_selfcheck) then
    if((dsx.lt.0.d0).or.(dsy.lt.0.d0).or.(dsz.lt.0.d0)) then
       write(stdo,*) 'ERROR: Negative dsz, dsy or dsz'
-      stop 1040
+      ierror = 3
+      return
+      !stop 1040
    endif
 endif
 !
@@ -2739,7 +2744,7 @@ end subroutine amrray_find_next_location_cart
 subroutine amrray_find_next_location_spher(ray_dsend,                &
                 ray_cart_x,ray_cart_y,ray_cart_z,                    &
                 ray_cart_dirx,ray_cart_diry,ray_cart_dirz,           &
-                ray_indexcurr,ray_indexnext,ray_ds,arrived,          &
+                ray_indexcurr,ray_indexnext,ray_ds,arrived,ierror,   &
                 distmin,levelnext,maxdeltasina)
 implicit none
 doubleprecision :: ray_cart_x,ray_cart_y,ray_cart_z
@@ -2748,7 +2753,7 @@ doubleprecision :: ray_dsend,ray_ds
 doubleprecision, optional :: distmin
 integer,optional :: levelnext
 doubleprecision, optional :: maxdeltasina
-integer :: ray_indexcurr,ray_indexnext
+integer :: ray_indexcurr,ray_indexnext,ierror
 logical :: arrived
 integer :: ihit
 doubleprecision :: axi(1:2,1:3),bxi(1:2,1:3)
@@ -2757,7 +2762,8 @@ doubleprecision :: angvec(1:3),sinang
 doubleprecision :: fact,xt,yt,zt,dummy,ds_r1,ds_r2,ds_t1,ds_t2,ds_p1,ds_p2
 integer :: idy,idz,ix,iy,iz,iddr,ilr,idir
 !integer :: idx
-doubleprecision :: r02,r0,rc0,theta0,phi0,cross_ds,ct2,st2,det,r002,r00
+ doubleprecision :: r02,r0,rc0,theta0,phi0,cross_ds,ct2,st2,det,r002,r00
+ doubleprecision :: viol_r,viol_t,viol_p,tol_r,tol_t,tol_p
 doubleprecision :: s00,sdet,sgnz,x00,y00,z00,x00dotdir,x0dotdir
 doubleprecision :: ds_try,dum,dum1,dum2,pa,pb,pc,eps
 doubleprecision :: r_r1,r_r2,r_t1,r_t2,r_p1,r_p2
@@ -2770,7 +2776,7 @@ doubleprecision :: z_r1,z_r2,z_t1,z_t2,z_p1,z_p2
 doubleprecision :: ds_sphere,ds_sphere0
 integer :: isph
 logical :: val_r1,val_r2,val_t1,val_t2,val_p1,val_p2
-logical :: topquadrant,crossequator
+ logical :: topquadrant,crossequator,outside_next
 logical :: doshift,dummyflag
 doubleprecision :: margin,err,cossindum,pabc
 logical :: hitmaxphi
@@ -2805,12 +2811,12 @@ if(amrray_selfcheck) then
       write(stdo,*) 'ERROR: Did not initalize AMRRay yet.'
       stop
    endif
-   dummy = sqrt(ray_cart_dirx**2+ray_cart_diry**2+ray_cart_dirz**2) 
-   if(abs(dummy-1.d0).gt.1d-10) then
-      write(stdo,*) 'ERROR: Direction vector is not unit vector'
-      write(stdo,*) ray_cart_dirx,ray_cart_diry,ray_cart_dirz
-      stop 2913
-   endif
+   !dummy = sqrt(ray_cart_dirx**2+ray_cart_diry**2+ray_cart_dirz**2) 
+   !if(abs(dummy-1.d0).gt.1d-10) then
+   !   write(stdo,*) 'ERROR: Direction vector is not unit vector'
+   !   write(stdo,*) ray_cart_dirx,ray_cart_diry,ray_cart_dirz
+   !   stop 2913
+   !endif
 endif
 !
 ! Check
@@ -2829,6 +2835,7 @@ ds_sphere0 = 1d99
 amrray_ispherehit = 0
 amrray_icross = 0
 hitmaxphi = .false.
+ierror = 0
 !
 ! If mirror symmetry required, first check and if necessary, flip
 ! NOTE: Let us simply not accept ray positions that are on the wrong side.
@@ -3019,13 +3026,37 @@ if(ray_indexcurr.le.0) then
            (theta0.le.amr_grid_xi(amr_grid_ny+1,2)).and.        &
            (phi0.ge.amr_grid_xi(1,3)).and.                      &
            (phi0.le.amr_grid_xi(amr_grid_nz+1,3))) then
-         write(stdo,*) 'ERROR: Cell index set to 0, so expect to be outside'
-         write(stdo,*) '       of the grid. But I find myself inside the grid.'
-         write(stdo,*) '       Clearly an internal error in the code.'
+         write(stdo,*) 'WARNING: Cell index set to 0, but position is inside grid.'
+         write(stdo,*) '         Nudging ray position to avoid boundary ambiguity.'
          write(stdo,*) ray_cart_x,ray_cart_y,ray_cart_z
          write(stdo,*) r0,theta0,phi0
          write(stdo,*) ray_cart_dirx,ray_cart_diry,ray_cart_dirz
-         stop 1090
+         dummy = max(abs(ray_cart_x),abs(ray_cart_y))
+         dummy = max(dummy,abs(ray_cart_z))
+         dummy = max(dummy,1.d0)
+         dummy = margin*small*dummy
+         ray_cart_x = ray_cart_x + dummy*ray_cart_dirx
+         ray_cart_y = ray_cart_y + dummy*ray_cart_diry
+         ray_cart_z = ray_cart_z + dummy*ray_cart_dirz
+         r02    = ray_cart_x*ray_cart_x + ray_cart_y*ray_cart_y + ray_cart_z*ray_cart_z
+         r0     = sqrt(r02)
+         theta0 = acos(ray_cart_z/(r0+1d-199))
+         if(ray_cart_x.eq.0.d0) then
+            if(ray_cart_y.ge.0.d0) then
+               phi0   = pihalf
+            else
+               phi0   = 3.d0*pihalf 
+            endif
+         else
+            phi0   = atan(ray_cart_y/ray_cart_x)
+            if(ray_cart_x.gt.0.d0) then
+               if(ray_cart_y.lt.0.d0) then
+                  phi0   = phi0 + twopi
+               endif
+            else
+               phi0   = phi0 + pi
+            endif
+         endif
       else
          write(stdo,*) 'PROBLEM: It appears that a star or other origin'
          write(stdo,*) '         of rays lies just outside the grid, but within'
@@ -4641,7 +4672,8 @@ else
          write(stdo,*) r0,theta0,phi0
          if(amr_tree_present) write(stdo,*) associated(amrray_cell),amrray_cell%id
          write(stdo,*) axi
-         stop 1131
+         ierror = 1
+         !stop 1131
       endif
    endif
    !
@@ -5415,63 +5447,63 @@ else
          doshift = .false.
       endif
    endif
-   if(doshift) then
-      !
-      ! Entering vacuum
-      !
-      select case(amrray_icross) 
-      case(1)
-         !
-         ! Shift a tiny bit inward
-         !
-         dummy      = 1.d0 - margin*small
-         ray_cart_x = ray_cart_x * dummy 
-         ray_cart_y = ray_cart_y * dummy
-         ray_cart_z = ray_cart_z * dummy
-      case(2)
-         !
-         ! Shift a tiny bit outward
-         !
-         dummy      = 1.d0 + margin*small
-         ray_cart_x = ray_cart_x * dummy 
-         ray_cart_y = ray_cart_y * dummy
-         ray_cart_z = ray_cart_z * dummy
-      case(3)
-         !
-         ! Shift a tiny bit by rotation toward positive z-axis
-         ! Note: we cannot have rcylnew=0.d0
-         !
-         rcylnew  = sqrt(ray_cart_x**2+ray_cart_y**2)
-         dummy    = margin*small*ray_cart_z / rcylnew
-         ray_cart_x = ray_cart_x - ray_cart_x * dummy
-         ray_cart_y = ray_cart_y - ray_cart_y * dummy
-         ray_cart_z = ray_cart_z + margin*small*rcylnew
-      case(4)
-         !
-         ! Shift a tiny bit by rotation toward negative z-axis
-         ! Note: we cannot have rcylnew=0.d0
-         !
-         rcylnew  = sqrt(ray_cart_x**2+ray_cart_y**2)
-         dummy    = margin*small*ray_cart_z / rcylnew
-         ray_cart_x = ray_cart_x + ray_cart_x * dummy
-         ray_cart_y = ray_cart_y + ray_cart_y * dummy
-         ray_cart_z = ray_cart_z - margin*small*rcylnew
-      case(5)
-         !
-         ! Shift a tiny bit clockwise
-         !
-         ray_cart_x = ray_cart_x + margin*small*ray_cart_y
-         ray_cart_y = ray_cart_y - margin*small*ray_cart_x
-      case(6)
-         !
-         ! Shift a tiny bit counter-clockwise
-         !
-         ray_cart_x = ray_cart_x - margin*small*ray_cart_y
-         ray_cart_y = ray_cart_y + margin*small*ray_cart_x
-      end select
-   endif
-   !
-   ! Do a check if all is OK. Only for debugging... 
+    if(doshift) then
+       !
+       ! Entering vacuum
+       !
+       select case(amrray_icross) 
+       case(1)
+          !
+          ! Shift a tiny bit inward
+          !
+          dummy      = 1.d0 - margin*small
+          ray_cart_x = ray_cart_x * dummy 
+          ray_cart_y = ray_cart_y * dummy
+          ray_cart_z = ray_cart_z * dummy
+       case(2)
+          !
+          ! Shift a tiny bit outward
+          !
+          dummy      = 1.d0 + margin*small
+          ray_cart_x = ray_cart_x * dummy 
+          ray_cart_y = ray_cart_y * dummy
+          ray_cart_z = ray_cart_z * dummy
+       case(3)
+          !
+          ! Shift a tiny bit by rotation toward positive z-axis
+          ! Note: we cannot have rcylnew=0.d0
+          !
+          rcylnew  = sqrt(ray_cart_x**2+ray_cart_y**2)
+          dummy    = margin*small*ray_cart_z / rcylnew
+          ray_cart_x = ray_cart_x - ray_cart_x * dummy
+          ray_cart_y = ray_cart_y - ray_cart_y * dummy
+          ray_cart_z = ray_cart_z + margin*small*rcylnew
+       case(4)
+          !
+          ! Shift a tiny bit by rotation toward negative z-axis
+          ! Note: we cannot have rcylnew=0.d0
+          !
+          rcylnew  = sqrt(ray_cart_x**2+ray_cart_y**2)
+          dummy    = margin*small*ray_cart_z / rcylnew
+          ray_cart_x = ray_cart_x + ray_cart_x * dummy
+          ray_cart_y = ray_cart_y + ray_cart_y * dummy
+          ray_cart_z = ray_cart_z - margin*small*rcylnew
+       case(5)
+          !
+          ! Shift a tiny bit clockwise
+          !
+          ray_cart_x = ray_cart_x + margin*small*ray_cart_y
+          ray_cart_y = ray_cart_y - margin*small*ray_cart_x
+       case(6)
+          !
+          ! Shift a tiny bit counter-clockwise
+          !
+          ray_cart_x = ray_cart_x - margin*small*ray_cart_y
+          ray_cart_y = ray_cart_y + margin*small*ray_cart_x
+       end select
+    endif
+    !
+    ! Do a check if all is OK. Only for debugging... 
    !
    !###########################################################
    if(amrray_selfcheck) then
@@ -5530,50 +5562,74 @@ else
                phi0=0.d0
             endif
          endif
-         if((r0>bxi(2,1)*oneplust).or.                 &
-              (r0<bxi(1,1)*oneminust).or.              &
-              (theta0>bxi(2,2)+tol).or.              &
-              (theta0<bxi(1,2)-tol).or.              &
-              (phi0>bxi(2,3)+tol).or.                &
-              (phi0<bxi(1,3)-tol)) then
-            write(stdo,*) 'ERROR: Photon outside of NEXT cell'
-            write(stdo,*) ray_cart_x,ray_cart_y,ray_cart_z
-            write(stdo,*) ray_cart_dirx,ray_cart_diry,ray_cart_dirz,  &
-                 sqrt(ray_cart_dirx**2+ray_cart_diry**2+ray_cart_dirz**2)
-            write(stdo,*) r0,theta0,phi0
-            if(amr_tree_present) write(stdo,*) associated(amrray_nextcell),amrray_nextcell%id,crossequator
-            write(stdo,*) bxi
-            write(stdo,*) 'amrray_icross = ',amrray_icross,', cross_ds = ',cross_ds,', idir = ',idir
-            if(amr_tree_present) then
-               if(.not.associated(amrray_cell)) then 
-                  write(stdo,*) 'Started outside of cell'
-               else
-                  write(stdo,*) 'Started inside of cell'
-                  write(stdo,*) axi
-               endif
+         outside_next = (r0>bxi(2,1)*oneplust).or.                 &
+              (r0<bxi(1,1)*oneminust).or.                         &
+              (theta0>bxi(2,2)+tol).or.                           &
+              (theta0<bxi(1,2)-tol).or.                           &
+              (phi0>bxi(2,3)+tol).or.                             &
+              (phi0<bxi(1,3)-tol)
+         if(outside_next) then
+            viol_r = max(0.d0, r0 - bxi(2,1)*oneplust)
+            viol_r = max(viol_r, bxi(1,1)*oneminust - r0)
+            viol_t = max(0.d0, theta0 - (bxi(2,2)+tol))
+            viol_t = max(viol_t, (bxi(1,2)-tol) - theta0)
+            viol_p = max(0.d0, phi0 - (bxi(2,3)+tol))
+            viol_p = max(viol_p, (bxi(1,3)-tol) - phi0)
+            tol_r  = 1d-10*max(r0,1.d0)
+            tol_t  = 10.d0*tol
+            tol_p  = 10.d0*tol
+            if((viol_r.le.tol_r).and.(viol_t.le.tol_t).and.(viol_p.le.tol_p)) then
+               dummy = max(abs(ray_cart_x),abs(ray_cart_y))
+               dummy = max(dummy,abs(ray_cart_z))
+               dummy = max(dummy,1.d0)
+               dummy = margin*small*dummy
+               ray_cart_x = ray_cart_x + dummy*ray_cart_dirx
+               ray_cart_y = ray_cart_y + dummy*ray_cart_diry
+               ray_cart_z = ray_cart_z + dummy*ray_cart_dirz
+               write(stdo,*) 'WARNING: Photon slightly outside NEXT cell; nudged.'
+               write(stdo,*) '  viol_r,viol_t,viol_p = ',viol_r,viol_t,viol_p
+               write(stdo,*) '  tol_r,tol_t,tol_p = ',tol_r,tol_t,tol_p
             else
-               if(amrray_ix_curr.le.0) then 
-                  write(stdo,*) 'Started outside of cell'
+               write(stdo,*) 'ERROR: Photon outside of NEXT cell'
+               write(stdo,*) ray_cart_x,ray_cart_y,ray_cart_z
+               write(stdo,*) ray_cart_dirx,ray_cart_diry,ray_cart_dirz,  &
+                    sqrt(ray_cart_dirx**2+ray_cart_diry**2+ray_cart_dirz**2)
+               write(stdo,*) r0,theta0,phi0
+               if(amr_tree_present) write(stdo,*) associated(amrray_nextcell),amrray_nextcell%id,crossequator
+               write(stdo,*) bxi
+               write(stdo,*) 'amrray_icross = ',amrray_icross,', cross_ds = ',cross_ds,', idir = ',idir
+               if(amr_tree_present) then
+                  if(.not.associated(amrray_cell)) then 
+                     write(stdo,*) 'Started outside of cell'
+                  else
+                     write(stdo,*) 'Started inside of cell'
+                     write(stdo,*) axi
+                  endif
                else
-                  write(stdo,*) 'Started inside of cell'
-                  write(stdo,*) axi
+                  if(amrray_ix_curr.le.0) then 
+                     write(stdo,*) 'Started outside of cell'
+                  else
+                     write(stdo,*) 'Started inside of cell'
+                     write(stdo,*) axi
+                  endif
                endif
+               write(stdo,*) 'sin2 cos2 = ',st2,ct2
+               if(amr_tree_present) then
+                  st2   = amrray_finegrid_sintsq1(amrray_cell%ixyzf(2),amrray_cell%level)
+                  ct2   = amrray_finegrid_costsq1(amrray_cell%ixyzf(2),amrray_cell%level)
+               else
+                  st2   = amrray_finegrid_sintsq1(amrray_iy_curr,0)
+                  ct2   = amrray_finegrid_costsq1(amrray_iy_curr,0)
+               endif
+               pa    = ct2*(ray_cart_dirx**2+ray_cart_diry**2)-st2*ray_cart_dirz**2
+               pb    = 2.d0*ct2*(ray_cart_dirx*ray_cart_x + ray_cart_diry*ray_cart_y) - &
+                    2.d0*st2*ray_cart_dirz*ray_cart_z
+               pc    = ct2*(ray_cart_x**2+ray_cart_y**2)-st2*ray_cart_z**2
+               write(stdo,*) pa,pb/r0,pc/r0**2
+               write(stdo,*) 4*pa*pc/pb**2
+               ierror = 2
+               !stop 1132
             endif
-            write(stdo,*) 'sin2 cos2 = ',st2,ct2
-            if(amr_tree_present) then
-               st2   = amrray_finegrid_sintsq1(amrray_cell%ixyzf(2),amrray_cell%level)
-               ct2   = amrray_finegrid_costsq1(amrray_cell%ixyzf(2),amrray_cell%level)
-            else
-               st2   = amrray_finegrid_sintsq1(amrray_iy_curr,0)
-               ct2   = amrray_finegrid_costsq1(amrray_iy_curr,0)
-            endif
-            pa    = ct2*(ray_cart_dirx**2+ray_cart_diry**2)-st2*ray_cart_dirz**2
-            pb    = 2.d0*ct2*(ray_cart_dirx*ray_cart_x + ray_cart_diry*ray_cart_y) - &
-                 2.d0*st2*ray_cart_dirz*ray_cart_z
-            pc    = ct2*(ray_cart_x**2+ray_cart_y**2)-st2*ray_cart_z**2
-            write(stdo,*) pa,pb/r0,pc/r0**2
-            write(stdo,*) 4*pa*pc/pb**2
-            stop 1132
          endif
       endif
    endif

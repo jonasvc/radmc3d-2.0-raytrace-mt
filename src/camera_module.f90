@@ -264,6 +264,7 @@ module camera_module
   !    which one.
   !
   integer :: camera_istar=0
+!$OMP THREADPRIVATE(camera_istar)
   !
   !    With how many pixels (in each direction) do we need to resolve the
   !    star(s) if we treat them as spheres?
@@ -1101,7 +1102,7 @@ subroutine camera_serial_raytrace(nrfreq,inu0,inu1,x,y,z,dx,dy,dz,distance,   &
   doubleprecision :: nstp,nu,nu0,nu0_prev,nu0_curr
   doubleprecision :: ap,jp(1:4),sp(1:4),ac,jc(1:4),sc(1:4),theomax(1:4),qdr(1:4)
   doubleprecision :: duc,eps,eps1,eps0,temp,resol,margin
-  integer :: nsteps,iline,ilactive,istep,idir
+  integer :: nsteps,iline,ilactive,istep,idir,ierror
   integer :: ixx,iyy,izz,bc_idir,bc_ilr
   double precision :: xbk,ybk,zbk,spx,spy,spz,rx1,ry1,rz1,rx0,ry0,rz0
   !
@@ -1422,7 +1423,7 @@ subroutine camera_serial_raytrace(nrfreq,inu0,inu1,x,y,z,dx,dy,dz,distance,   &
            call amrray_find_next_location_cart(ray_dsend,            &
                 ray_cart_x,ray_cart_y,ray_cart_z,                    &
                 ray_cart_dirx,ray_cart_diry,ray_cart_dirz,           &
-                ray_index,ray_indexnext,ray_ds,arrived,              &
+                ray_index,ray_indexnext,ray_ds,arrived,ierror,       &
                 levelnext=levelnext)
            !
            ! Check if this cell is the smallest so far
@@ -1495,7 +1496,7 @@ subroutine camera_serial_raytrace(nrfreq,inu0,inu1,x,y,z,dx,dy,dz,distance,   &
               call amrray_find_next_location_spher(ray_dsend,           &
                    ray_cart_x,ray_cart_y,ray_cart_z,                    &
                    ray_cart_dirx,ray_cart_diry,ray_cart_dirz,           &
-                   ray_index,ray_indexnext,ray_ds,arrived)
+                   ray_index,ray_indexnext,ray_ds,arrived,ierror)
            else
               !
               ! The case when we want to prevent too strong jumps
@@ -1504,7 +1505,7 @@ subroutine camera_serial_raytrace(nrfreq,inu0,inu1,x,y,z,dx,dy,dz,distance,   &
               call amrray_find_next_location_spher(ray_dsend,           &
                    ray_cart_x,ray_cart_y,ray_cart_z,                    &
                    ray_cart_dirx,ray_cart_diry,ray_cart_dirz,           &
-                   ray_index,ray_indexnext,ray_ds,arrived,              &
+                   ray_index,ray_indexnext,ray_ds,arrived,ierror,       &
                    maxdeltasina=camera_maxdphi)
            endif
            !
@@ -2793,6 +2794,7 @@ recursive subroutine camera_compute_one_pixel(nrfreq,inu0,inu1,px,py,pdx,pdy,  &
   !
   ! Increase the counter
   !
+  !$OMP ATOMIC
   camera_subpixeling_npixtot = camera_subpixeling_npixtot + 1
   !
   ! Check if we need to refine our pixel
@@ -2838,14 +2840,16 @@ recursive subroutine camera_compute_one_pixel(nrfreq,inu0,inu1,px,py,pdx,pdy,  &
         ! Need to refine, but not allowed. We must warn that our resolving
         ! power is simply not sufficient.
         !
-        camera_warn_resolution = .true.
+      !$OMP ATOMIC WRITE
+      camera_warn_resolution = .true.
      endif
   else
      !
      ! No refinement was done, so this pixel also counts as a "fine" pixel
      ! So increase that counter (this is just for diagnostics; it's non-essential)
      !
-     camera_subpixeling_npixfine = camera_subpixeling_npixfine + 1
+      !$OMP ATOMIC
+      camera_subpixeling_npixfine = camera_subpixeling_npixfine + 1
   endif
   !
   ! Include stellar spheres
@@ -4165,6 +4169,7 @@ subroutine camera_make_rect_image(img,tausurf)
     integer :: inuu
     integer :: backup_nrrefine,backup_tracemode
     logical :: warn_tausurf_problem,flag_quv_too_big
+    double precision :: intensity_local(camera_nrfreq,1:4)
     !
     ! Reset some non-essential counters
     !
@@ -4181,6 +4186,9 @@ subroutine camera_make_rect_image(img,tausurf)
        ! *** NEAR FUTURE: PUT OPENMP DIRECTIVES HERE (START) ***
        !
        flag_quv_too_big = .false.
+       !$OMP PARALLEL DO DEFAULT(shared) PRIVATE(ix,iy,px,py,inuu,quvsq,intensity_local) &
+       !$OMP REDUCTION(.OR.:flag_quv_too_big) SCHEDULE(dynamic) COLLAPSE(2)             &
+       !$OMP IF(.not.camera_diagnostics_subpix)
        do iy=1,camera_image_ny
           do ix=1,camera_image_nx
              !
@@ -4197,32 +4205,32 @@ subroutine camera_make_rect_image(img,tausurf)
              ! recursion is limited to nrrefine depth levels.
              !
              call camera_compute_one_pixel(camera_nrfreq,inu00,inu11,px,py,pdx,pdy,    &
-                                           camera_nrrefine,camera_intensity_iquv,-1)
+                                           camera_nrrefine,intensity_local,-1)
              !
              ! Put the result into the image array
              !
-             camera_rect_image_iquv(ix,iy,inu00:inu11,1) = camera_intensity_iquv(inu00:inu11,1)
+             camera_rect_image_iquv(ix,iy,inu00:inu11,1) = intensity_local(inu00:inu11,1)
              if(camera_stokesvector) then
                 !
                 ! Copy also the other Stokes components
                 !
-                camera_rect_image_iquv(ix,iy,inu00:inu11,2) = camera_intensity_iquv(inu00:inu11,2)
-                camera_rect_image_iquv(ix,iy,inu00:inu11,3) = camera_intensity_iquv(inu00:inu11,3)
-                camera_rect_image_iquv(ix,iy,inu00:inu11,4) = camera_intensity_iquv(inu00:inu11,4)
+                camera_rect_image_iquv(ix,iy,inu00:inu11,2) = intensity_local(inu00:inu11,2)
+                camera_rect_image_iquv(ix,iy,inu00:inu11,3) = intensity_local(inu00:inu11,3)
+                camera_rect_image_iquv(ix,iy,inu00:inu11,4) = intensity_local(inu00:inu11,4)
                 !
                 ! Self-consistency check
                 !
                 do inuu=inu00,inu11
-                   quvsq = camera_intensity_iquv(inuu,2)**2 + &
-                           camera_intensity_iquv(inuu,3)**2 + &
-                           camera_intensity_iquv(inuu,4)**2
+                   quvsq = intensity_local(inuu,2)**2 + &
+                           intensity_local(inuu,3)**2 + &
+                           intensity_local(inuu,4)**2
                    if(quvsq.gt.0.d0) then
-                      if(camera_intensity_iquv(inuu,1).eq.0.d0) then
+                      if(intensity_local(inuu,1).eq.0.d0) then
                          write(stdo,*) 'INTERNAL ERROR: Q^2+U^2+V^2>0 but I=0...'
                          write(stdo,*) '    Warn author.'
                          stop
                       endif
-                      quvsq = quvsq / camera_intensity_iquv(inuu,1)**2
+                      quvsq = quvsq / intensity_local(inuu,1)**2
                       if(quvsq.gt.1.000001d0) then
                          flag_quv_too_big = .true.
                       endif
@@ -4232,6 +4240,7 @@ subroutine camera_make_rect_image(img,tausurf)
              !
           enddo
        enddo
+       !$OMP END PARALLEL DO
        if(flag_quv_too_big) then
           write(stdo,*) 'WARNING: While making an image, I found an instance of Q^2+U^2+V^2>I^2...'
        endif
@@ -5238,7 +5247,7 @@ subroutine camera_ray1d_raytrace(nrfreq,x,y,z,dx,dy,dz,distance,celldxmin,&
   double precision :: x,y,z,dx,dy,dz,dum,distance,celldxmin
   double precision :: freq,alpnu,jnu,alpha_a,dummy,expt,temp,src
   integer :: ispec,nrfreq,deepestlevel
-  integer :: inu,levelnext,is
+  integer :: inu,levelnext,is,ierror
   logical :: arrived
   double precision :: intensity(nrfreq)
   double precision :: rlen,cosp,sinp,cost,sint,vx,vy,vz
@@ -5406,7 +5415,7 @@ subroutine camera_ray1d_raytrace(nrfreq,x,y,z,dx,dy,dz,distance,celldxmin,&
            call amrray_find_next_location_cart(ray_dsend,            &
                 ray_cart_x,ray_cart_y,ray_cart_z,                    &
                 ray_cart_dirx,ray_cart_diry,ray_cart_dirz,           &
-                ray_index,ray_indexnext,ray_ds,arrived,              &
+                ray_index,ray_indexnext,ray_ds,arrived,ierror,       &
                 levelnext=levelnext)
            !
            ! Check if this cell is the smallest so far
@@ -5466,7 +5475,7 @@ subroutine camera_ray1d_raytrace(nrfreq,x,y,z,dx,dy,dz,distance,celldxmin,&
            call amrray_find_next_location_spher(ray_dsend,           &
                 ray_cart_x,ray_cart_y,ray_cart_z,                    &
                 ray_cart_dirx,ray_cart_diry,ray_cart_dirz,           &
-                ray_index,ray_indexnext,ray_ds,arrived)
+                ray_index,ray_indexnext,ray_ds,arrived,ierror)
            !
            ! Check if this cell is the smallest so far
            !
@@ -7174,13 +7183,18 @@ subroutine camera_make_circ_image()
     integer :: backup_nrrefine,backup_tracemode
     logical :: warn_tausurf_problem,flag_quv_too_big
     double precision :: r,phi
+    double precision :: intensity_local(camera_nrfreq,1:4)
     !
     ! *** NEAR FUTURE: PUT OPENMP DIRECTIVES HERE (START) ***
     !
     flag_quv_too_big = .false.
+    !$OMP PARALLEL DO DEFAULT(shared)                                                      &
+    !$OMP PRIVATE(ir,iphi,r,phi,px,py,x,y,z,dirx,diry,dirz,distance,celldxmin,inu,inuu,quvsq, &
+    !$OMP         intensity_local) REDUCTION(.OR.:flag_quv_too_big) SCHEDULE(dynamic)       &
+    !$OMP COLLAPSE(2) IF(.not.camera_diagnostics_subpix)
     do ir=1,camera_image_nr
-       r = cim_rc(ir)
        do iphi=1,camera_image_nphi
+          r = cim_rc(ir)
           phi = cim_pc(iphi)
           !
           ! Set the ray variables
@@ -7195,43 +7209,43 @@ subroutine camera_make_circ_image()
           ! Reset intensity
           ! 
           if(incl_extlum.eq.0) then
-             camera_intensity_iquv(inu00:inu11,1:4) = 0.d0
+             intensity_local(inu00:inu11,1:4) = 0.d0
           else
              do inu=inu00,inu11
-                camera_intensity_iquv(inu,1)   = find_extlumintens_interpol(camera_frequencies(inu))
-                camera_intensity_iquv(inu,2:4) = 0.d0
+                intensity_local(inu,1)   = find_extlumintens_interpol(camera_frequencies(inu))
+                intensity_local(inu,2:4) = 0.d0
              enddo
           endif
           !
           ! Call the ray-tracer 
           !
           call camera_serial_raytrace(camera_nrfreq,inu00,inu11,x,y,z,dirx,diry,dirz, &
-                                      distance,celldxmin,camera_intensity_iquv)
+                                      distance,celldxmin,intensity_local)
           !
           ! Put the result into the image array
           !
-          camera_circ_image_iquv(ir,iphi,inu00:inu11,1) = camera_intensity_iquv(inu00:inu11,1)
+          camera_circ_image_iquv(ir,iphi,inu00:inu11,1) = intensity_local(inu00:inu11,1)
           if(camera_stokesvector) then
              !
              ! Copy also the other Stokes components
              !
-             camera_circ_image_iquv(ir,iphi,inu00:inu11,2) = camera_intensity_iquv(inu00:inu11,2)
-             camera_circ_image_iquv(ir,iphi,inu00:inu11,3) = camera_intensity_iquv(inu00:inu11,3)
-             camera_circ_image_iquv(ir,iphi,inu00:inu11,4) = camera_intensity_iquv(inu00:inu11,4)
+             camera_circ_image_iquv(ir,iphi,inu00:inu11,2) = intensity_local(inu00:inu11,2)
+             camera_circ_image_iquv(ir,iphi,inu00:inu11,3) = intensity_local(inu00:inu11,3)
+             camera_circ_image_iquv(ir,iphi,inu00:inu11,4) = intensity_local(inu00:inu11,4)
              !
              ! Self-consistency check
              !
              do inuu=inu00,inu11
-                quvsq = camera_intensity_iquv(inuu,2)**2 + &
-                        camera_intensity_iquv(inuu,3)**2 + &
-                        camera_intensity_iquv(inuu,4)**2
+                quvsq = intensity_local(inuu,2)**2 + &
+                        intensity_local(inuu,3)**2 + &
+                        intensity_local(inuu,4)**2
                 if(quvsq.gt.0.d0) then
-                   if(camera_intensity_iquv(inuu,1).eq.0.d0) then
+                   if(intensity_local(inuu,1).eq.0.d0) then
                       write(stdo,*) 'INTERNAL ERROR: Q^2+U^2+V^2>0 but I=0...'
                       write(stdo,*) '    Warn author.'
                       stop
                    endif
-                   quvsq = quvsq / camera_intensity_iquv(inuu,1)**2
+                   quvsq = quvsq / intensity_local(inuu,1)**2
                    if(quvsq.gt.1.000001d0) then
                       flag_quv_too_big = .true.
                    endif
@@ -7241,6 +7255,7 @@ subroutine camera_make_circ_image()
           !
        enddo
     enddo
+    !$OMP END PARALLEL DO
     !
     ! *** NEAR FUTURE: PUT OPENMP DIRECTIVES HERE (FINISH) ***
     !
@@ -7927,6 +7942,3 @@ end subroutine pol_integrate_rt_aligned
 
 
 end module camera_module
-
-
-

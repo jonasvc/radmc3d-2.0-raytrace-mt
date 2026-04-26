@@ -10,7 +10,7 @@ OPTIM = -O2 -fopenmp
 
 # For using the OpenMP parallel version of RADMC-3D one has to add '-fopenmp' in
 # the next command line (see also the RADMC-3D manual).
-FF = gfortran
+FF = gfortran -fopenmp
 
 # Boundary check
 # BCHECK   = -fbounds-check
