@@ -3770,7 +3770,14 @@ if(ray_indexcurr.le.0) then
       !
       dum1 = ray_cart_x*amrray_sinp1 - ray_cart_y*amrray_cosp1
       dum2 = ray_cart_diry*amrray_cosp1 - ray_cart_dirx*amrray_sinp1
-      if(dum2.eq.0.d0) then
+      !
+      ! Defensive: reject rays nearly parallel to the phi1 cone. The original
+      ! check dum2.eq.0.d0 only fires on exact zero, but rays grazing the
+      ! seam can have |dum2| ~ machine epsilon, producing a spurious tiny
+      ! ds_p1 that places the ray in the wrong cyclic-wrapped cell and skips
+      ! optical depth -> radial streak at the phi=0/2pi seam.
+      !
+      if(abs(dum2).lt.1d-14) then
          val_p1 = .false.
          ds_p1 = -1d99
       else
@@ -3876,7 +3883,12 @@ if(ray_indexcurr.le.0) then
       !
       dum1 = ray_cart_x*amrray_sinp2 - ray_cart_y*amrray_cosp2
       dum2 = ray_cart_diry*amrray_cosp2 - ray_cart_dirx*amrray_sinp2
-      if(dum2.eq.0.d0) then
+      !
+      ! Defensive: see comment at the matching phi1 block above. Same fix
+      ! applies to the phi2=2pi cone for rays grazing the seam from the
+      ! other side.
+      !
+      if(abs(dum2).lt.1d-14) then
          val_p2 = .false.
          ds_p2 = -1d99
       else

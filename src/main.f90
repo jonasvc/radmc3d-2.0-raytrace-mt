@@ -240,6 +240,8 @@ program radmc3d
   rt_mcparams%mrw_tempthres    = 3.d0    ! Below T=3K we do not recalculate the mean opacities for MRW
   mcscat_nrdirs = 0 
   mc_scat_maxtauabs            = 30.d0   ! Default value
+  mcscat_phi_coarsen           = 1       ! 1 = no coarsening; >1 averages scatsrc over N phi cells (user-set noise suppression)
+  mc_peeledoff                 = 0       ! 0 = off (use cell-binned MC source); 1 = on (next-event estimator into image)
   mc_max_nr_scat_events        = -1      ! Default value. If >=0 then limit nr of scattering events treated in images.
   mc_weighted_photons          = .true.
   scat_munr                    = 0       ! The dust opacity files will set the nr of scattering angles mu
@@ -2291,6 +2293,8 @@ subroutine read_radmcinp_file()
      call parse_input_integer('scattering_mode_max@          ',scattering_mode_max)
      call parse_input_integer('alignment_mode@               ',alignment_mode)
      call parse_input_double ('mc_scat_maxtauabs@            ',mc_scat_maxtauabs)
+     call parse_input_integer('mcscat_phi_coarsen@           ',mcscat_phi_coarsen)
+     call parse_input_integer('mc_peeledoff@                 ',mc_peeledoff)
      call parse_input_integer('scat_munr@                    ',scat_munr)
      !call parse_input_integer('scat_phinr@                   ',scat_phinr)
      call parse_input_integer('dust_2daniso_nphi@            ',dust_2daniso_nphi)

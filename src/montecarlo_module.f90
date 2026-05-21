@@ -132,6 +132,74 @@ double precision,allocatable :: mc_ilastphot(:),mc_iphotcount(:)
 double precision :: mc_iphotcurr
 !!!!!integer(kind=8),allocatable :: mc_ilastphot(:),mc_iphotcount(:)
 !!!!!integer(kind=8) :: mc_iphotcurr
+!
+! Photon index / total used by stratified-phi stellar emission in walk_full_path_scat.
+! Set before each call to walk_full_path_scat in do_monte_carlo_scattering.
+! Threadprivate so each OMP thread tracks its own photon.
+integer*8 :: mc_scat_iphot_strat = 0_8
+integer*8 :: mc_scat_nphot_strat = 0_8
+integer*8 :: mc_scat_strat_tau   = 0_8
+integer*8, parameter :: mc_scat_N_tau = 1000_8
+logical :: mc_scat_direct_stellar_scatsrc = .false.
+logical :: mc_scat_skip_first_stellar_scatsrc = .false.
+logical :: mc_therm_direct_stellar_heating = .false.
+logical :: mc_therm_skip_first_stellar_heating = .false.
+!
+! User-controlled azimuthal coarsening of the scattering source function.
+! N=1 (default) leaves the scatsrc untouched. N>1 averages the scatsrc over
+! blocks of N consecutive phi cells *after* the MC photon loop completes,
+! reducing cell-level Poisson noise (the radial-spoke artifact in images) at
+! the cost of smoothing real azimuthal structure on scales finer than N
+! cells. Only takes effect on a regular spherical grid (igrid_coord 100-199,
+! amr_style=0).
+!
+integer :: mcscat_phi_coarsen = 1
+!
+! Peeled-off (next-event) scattering estimator.
+!   mc_peeledoff        : user knob (0 = off, 1 = on). Read from radmc3d.inp.
+!   mc_peeledoff_active : set in camera_make_rect_image once activation
+!                         conditions are satisfied. When .true., walk_cells_scat
+!                         calls montecarlo_peeledoff_scatsrc at every scattering
+!                         event and skips the per-cell mcscat_scatsrc_iquv
+!                         deposit so that the deterministic first-scatter
+!                         contribution is preserved in mcscat_scatsrc_iquv
+!                         without being doubled by MC.
+!
+integer :: mc_peeledoff = 0
+logical :: mc_peeledoff_active = .false.
+!
+! Peeled-off (next-event) scattering estimator state set by camera_make_rect_image
+! before the scattering MC is launched. Held in the MC module so walk_cells_scat
+! can reach it without introducing a circular dependency on the camera module.
+!
+!   mc_peeledoff_ex/ey   : image-plane basis vectors (unit, perpendicular to obs dir)
+!   mc_peeledoff_dir     : unit vector from grid origin toward the observer (==camera_dir)
+!   mc_peeledoff_cx/y/z  : 3-D pointing position of the image centre
+!   mc_peeledoff_pdx/pdy : pixel sizes in cm (observer-at-infinity)
+!   mc_peeledoff_xref/yref: image-plane centre offsets (== camera_zoomcenter_*)
+!   mc_peeledoff_nx/ny   : number of pixels in the image
+!   mc_peeledoff_nfreq   : number of frequencies in the image
+!   mc_peeledoff_iquv    : accumulator added to camera_rect_image_iquv after raytrace
+!
+double precision :: mc_peeledoff_ex(1:3)  = 0.d0
+double precision :: mc_peeledoff_ey(1:3)  = 0.d0
+double precision :: mc_peeledoff_dir(1:3) = 0.d0
+double precision :: mc_peeledoff_cx       = 0.d0
+double precision :: mc_peeledoff_cy       = 0.d0
+double precision :: mc_peeledoff_cz       = 0.d0
+double precision :: mc_peeledoff_pdx      = 0.d0
+double precision :: mc_peeledoff_pdy      = 0.d0
+double precision :: mc_peeledoff_xref     = 0.d0
+double precision :: mc_peeledoff_yref     = 0.d0
+integer          :: mc_peeledoff_nx      = 0
+integer          :: mc_peeledoff_ny      = 0
+integer          :: mc_peeledoff_nfreq   = 0
+! camera-side frequency index for the current MC run. Used in Method 2
+! (camera_mcscat_monochromatic), where the MC sees ray_inu=1 but the image
+! slot is camera_frequencies(inu0). Method 1 leaves this at 0 and the
+! peel-off uses ray_inu directly.
+integer          :: mc_peeledoff_inu_camera = 0
+double precision, allocatable :: mc_peeledoff_iquv(:,:,:,:)
 ! 
 ! For arrays of integrals as a function of temperature
 !
@@ -280,8 +348,10 @@ integer :: selectscat_iscat_last  = 1000000000
 !$OMP THREADPRIVATE(alphacum)
 !$OMP THREADPRIVATE(alpha_a_tot, alpha_s_tot)
 !$OMP THREADPRIVATE(mc_iphotcurr)
+!$OMP THREADPRIVATE(mc_scat_iphot_strat, mc_scat_nphot_strat, mc_scat_strat_tau)
+!$OMP THREADPRIVATE(mc_scat_skip_first_stellar_scatsrc)
+!$OMP THREADPRIVATE(mc_therm_skip_first_stellar_heating)
 !$OMP THREADPRIVATE(enercum)
-!$OMP THREADPRIVATE(mrw_alpha_tot_ross)
 !$OMP THREADPRIVATE(alpha_t_rm,alpha_a_pm_tot)
 !$OMP THREADPRIVATE(alpha_a_pm,mrw_dcumen)
 !$OMP THREADPRIVATE(mc_photon_destroyed)
@@ -637,14 +707,12 @@ subroutine montecarlo_init(params,ierr,mcaction,resetseed)
            stop
         endif
         mrw_cumulener_bk(:) = 0.d0
-        !$OMP PARALLEL
         allocate(mrw_alpha_tot_ross(1:nrcellsmax),STAT=ierr)
         if(ierr.ne.0) then
            write(stdo,*) 'ERROR in Monte Carlo Module: MRW arrays could not be allocated.'
            stop
         endif
         mrw_alpha_tot_ross(:) = 0.d0
-        !$OMP END PARALLEL
         allocate(mrw_cell_uses_mrw(1:nrcellsmax),STAT=ierr)
         if(ierr.ne.0) then
            write(stdo,*) 'ERROR in Monte Carlo Module: MRW arrays could not be allocated.'
@@ -1206,6 +1274,7 @@ subroutine montecarlo_partial_cleanup()
   if(allocated(mrw_db_temp)) deallocate(mrw_db_temp)
   if(allocated(mrw_db_kappa_abs_planck)) deallocate(mrw_db_kappa_abs_planck)
   if(allocated(mrw_cell_uses_mrw)) deallocate(mrw_cell_uses_mrw)
+  if(allocated(mrw_alpha_tot_ross)) deallocate(mrw_alpha_tot_ross)
   if(allocated(mc_align_mu)) deallocate(mc_align_mu)
   if(allocated(mc_align_orth)) deallocate(mc_align_orth)
   if(allocated(mc_align_para)) deallocate(mc_align_para)
@@ -1218,7 +1287,6 @@ subroutine montecarlo_partial_cleanup()
   if(allocated(alphacum)) deallocate(alphacum)
   if(allocated(alpha_a_pm)) deallocate(alpha_a_pm)
   if(allocated(mrw_dcumen)) deallocate(mrw_dcumen)
-  if(allocated(mrw_alpha_tot_ross)) deallocate(mrw_alpha_tot_ross)
   if(allocated(mcscat_phasefunc)) deallocate(mcscat_phasefunc)
   !$OMP END PARALLEL
   !
@@ -2488,6 +2556,13 @@ subroutine do_monte_carlo_bjorkmanwood(params,ierror,resetseed)
      endif
   endif
   !   
+  ! Add the direct stellar heating deterministically when the grid/source
+  ! setup supports the radial estimator. The photon walk below then
+  ! suppresses only the duplicate first-leg stellar heating tally.
+  !
+  mc_therm_direct_stellar_heating = .false.
+  call montecarlo_add_direct_stellar_heating(params,mc_therm_direct_stellar_heating)
+  !
   ! Open the path file
   ! For debugging only!
   !
@@ -2616,7 +2691,10 @@ subroutine do_monte_carlo_bjorkmanwood(params,ierror,resetseed)
          !
          ! For the photon count routines:
          !
-         mc_iphotcurr = iphot
+         mc_iphotcurr        = iphot
+         mc_scat_strat_tau   = mod(iphot - 1_8, mc_scat_N_tau)
+         mc_scat_iphot_strat = ((iphot - 1_8) / mc_scat_N_tau) + 1_8
+         mc_scat_nphot_strat = max(1_8,(nphot + mc_scat_N_tau - 1_8) / mc_scat_N_tau)
          !
          ! Message
          !
@@ -2927,6 +3005,8 @@ subroutine do_monte_carlo_scattering(params,ierror,resetseed,scatsrc,meanint)
   countwrite = params%countwrite
   cntdump    = params%cntdump
   if(compute_scatsrc) then
+     write(stdo,*) 'MC spoke-artifact patch: direct stellar first-scattering estimator available.'
+     call flush(stdo)
      nphot      = params%nphot_scat
   else
      nphot      = params%nphot_mono
@@ -3182,6 +3262,16 @@ subroutine do_monte_carlo_scattering(params,ierror,resetseed,scatsrc,meanint)
      !
      mc_scat_energy_rellimit = exp(-mc_scat_maxtauabs)
      !
+     ! Add the direct stellar first-scattering source deterministically when
+     ! the grid/source setup supports the fast radial estimator. The photon
+     ! walk below then suppresses only the duplicate first-leg stellar tally.
+     !
+     mc_scat_direct_stellar_scatsrc = .false.
+     if(compute_scatsrc.and.(selectscat_iscat_first.le.1).and.   &
+          (selectscat_iscat_last.ge.1)) then
+        call montecarlo_add_direct_stellar_scatsrc(inu,mc_scat_direct_stellar_scatsrc)
+     endif
+     !
      ! Set ray_inu to inu
      !
      ray_inu = inu
@@ -3223,7 +3313,10 @@ subroutine do_monte_carlo_scattering(params,ierror,resetseed,scatsrc,meanint)
         !
         ! For the photon count routines:
         !
-        mc_iphotcurr = iphot
+        mc_iphotcurr        = iphot
+        mc_scat_strat_tau   = mod(iphot - 1_8, mc_scat_N_tau)
+        mc_scat_iphot_strat = ((iphot - 1_8) / mc_scat_N_tau) + 1_8
+        mc_scat_nphot_strat = max(1_8,(nphot + mc_scat_N_tau - 1_8) / mc_scat_N_tau)
         !
         ! Message
         !
@@ -3286,6 +3379,14 @@ subroutine do_monte_carlo_scattering(params,ierror,resetseed,scatsrc,meanint)
       return
   endif
   enddo
+  !
+  ! Optional: user-controlled azimuthal coarsening of the scattering source
+  ! to suppress per-cell Poisson noise (radial-spoke artifact). Off when
+  ! mcscat_phi_coarsen<=1 (the default).
+  !
+  if(compute_scatsrc.and.(mcscat_phi_coarsen.gt.1)) then
+     call montecarlo_coarsen_scatsrc_phi(mcscat_phi_coarsen)
+  endif
   !
   ! If the optically very thick cells are skipped as sources of photons,
   ! then also make their scattering source functions equal to the planck
@@ -4212,6 +4313,758 @@ subroutine do_lambda_starlight_single_scattering_simple(params,ierror,scatsrc,me
 end subroutine do_lambda_starlight_single_scattering_simple
 
 
+!--------------------------------------------------------------------------
+!         DETERMINISTIC DIRECT STELLAR SCATTERING SOURCE
+!
+! Add the first-scattering source from a single central star directly to
+! mcscat_scatsrc_iquv for a regular spherical grid. This removes the radial
+! columns produced by the continuous estimator along randomly sampled stellar
+! packet trajectories. Higher-order scattering remains Monte Carlo.
+!--------------------------------------------------------------------------
+subroutine montecarlo_add_direct_stellar_scatsrc(inu,did_add)
+  implicit none
+  integer, intent(in) :: inu
+  logical, intent(out) :: did_add
+  integer :: ir,itheta,iphi,ispec,index,idir
+  double precision :: alpha_a_dir,alpha_s_dir,alpha_tot,dtau,dvol
+  double precision :: luminosity,albedo,ds,xp1,flux,scatsrc0,star_offset,origin_tol
+  double precision :: theta,phi,r,costheta,g,src4(1:4)
+  double precision :: cosdphi,sindphi,deltaphi,xbk,ybk,levent,cosphievent,sinphievent
+  !
+  did_add = .false.
+  !
+  if(.not.allocated(mcscat_scatsrc_iquv)) return
+  if(scattering_mode.lt.1) return
+  if(scattering_mode.gt.5) return
+  if(mcscat_nrdirs.le.0) return
+  if((scattering_mode.gt.1).and.(.not.allocated(mcscat_dirs))) return
+  if((scattering_mode.ge.4).and.(.not.allocated(mcscat_svec))) return
+  if(mcscat_localobserver) return
+  if((igrid_coord.lt.100).or.(igrid_coord.ge.200)) return
+  if(amr_style.ne.0) return
+  if(igrid_mirror.eq.1) return
+  if(nstars.ne.1) return
+  if(star_lum(1).le.0.d0) return
+  if(amr_grid_nx.le.0) return
+  if(amr_grid_ny.le.0) return
+  if(amr_grid_nz.le.0) return
+  !
+  star_offset = sqrt(star_pos(1,1)**2+star_pos(2,1)**2+star_pos(3,1)**2)
+  origin_tol  = 1d-12 * max(1.d0,amr_grid_xi(amr_grid_nx+1,1))
+  if(star_offset.gt.origin_tol) return
+  !
+  did_add = .true.
+  !
+  if(inu.eq.1) then
+     write(stdo,*) 'MC variance reduction: deterministic direct stellar first-scattering source enabled.'
+     write(stdo,*) '  Applies to regular spherical grid, central star, scattering_mode=',scattering_mode
+     if(star_sphere) then
+        write(stdo,*) '  Direct source uses point-star attenuation; finite star MC is kept for later scattering.'
+     endif
+     call flush(stdo)
+  endif
+  !
+  !$OMP PARALLEL DO SCHEDULE(static) DEFAULT(shared)                         &
+  !$OMP& PRIVATE(iphi,ir,ispec,index,luminosity,alpha_a_dir,alpha_s_dir)     &
+  !$OMP& PRIVATE(alpha_tot,dtau,dvol,albedo,ds,xp1,flux,scatsrc0)            &
+  !$OMP& PRIVATE(idir,theta,phi,r,costheta,g,src4,cosdphi,sindphi)           &
+  !$OMP& PRIVATE(deltaphi,xbk,ybk,levent,cosphievent,sinphievent)
+  do itheta=1,amr_grid_ny
+     do iphi=1,amr_grid_nz
+        !
+        theta = 0.5d0 * (amr_grid_xi(itheta+1,2) + amr_grid_xi(itheta,2))
+        phi   = 0.5d0 * (amr_grid_xi(iphi+1,3) + amr_grid_xi(iphi,3))
+        ray_cart_dirx = sin(theta) * cos(phi)
+        ray_cart_diry = sin(theta) * sin(phi)
+        ray_cart_dirz = cos(theta)
+        !
+        luminosity = star_lum(1)
+        !
+        do ir=1,amr_grid_nx
+           index = ir + (itheta-1)*amr_grid_nx + (iphi-1)*amr_grid_nx*amr_grid_ny
+           ds    = amr_grid_xi(ir+1,1) - amr_grid_xi(ir,1)
+           r     = 0.5d0 * (amr_grid_xi(ir+1,1) + amr_grid_xi(ir,1))
+           ray_cart_x = r * ray_cart_dirx
+           ray_cart_y = r * ray_cart_diry
+           ray_cart_z = r * ray_cart_dirz
+           !
+           alpha_a_dir = 0.d0
+           alpha_s_dir = 0.d0
+           do ispec=1,dust_nr_species
+              alpha_a_dir = alpha_a_dir + dustdens(ispec,index) * kappa_a(inu,ispec) + 1d-99
+              alpha_s_dir = alpha_s_dir + dustdens(ispec,index) * kappa_s(inu,ispec) + 1d-99
+           enddo
+           alpha_tot = alpha_a_dir + alpha_s_dir
+           dtau      = alpha_tot * ds
+           albedo    = alpha_s_dir / alpha_tot
+           dvol      = (fourpi/3.d0) * ( amr_grid_xi(ir+1,1)**3 - amr_grid_xi(ir,1)**3 )
+           !
+           if(dtau.lt.1d-6) then
+              xp1 = dtau
+           else
+              xp1 = 1.d0 - exp(-dtau)
+           endif
+           !
+           flux = luminosity * xp1 / (dvol * alpha_tot)
+           if(scattering_mode.eq.1) then
+              !
+              ! Isotropic scattering: simply add the source term.
+              !
+              scatsrc0 = flux * albedo * alpha_tot / fourpi
+              mcscat_scatsrc_iquv(inu,index,1,1) =                       &
+                   mcscat_scatsrc_iquv(inu,index,1,1) + scatsrc0
+           elseif((scattering_mode.eq.2).or.(scattering_mode.eq.3)) then
+              !
+              ! Anisotropic scalar scattering.
+              !
+              if(scattering_mode.eq.2) then
+                 do idir=1,mcscat_nrdirs
+                    costheta = ray_cart_dirx*mcscat_dirs(1,idir) +   &
+                         ray_cart_diry*mcscat_dirs(2,idir) +         &
+                         ray_cart_dirz*mcscat_dirs(3,idir)
+                    do ispec=1,dust_nr_species
+                       g = kappa_g(inu,ispec)
+                       mcscat_phasefunc(idir,ispec) =                &
+                            henyeygreenstein_phasefunc(g,costheta)
+                    enddo
+                 enddo
+              else
+                 do idir=1,mcscat_nrdirs
+                    costheta = ray_cart_dirx*mcscat_dirs(1,idir) +   &
+                         ray_cart_diry*mcscat_dirs(2,idir) +         &
+                         ray_cart_dirz*mcscat_dirs(3,idir)
+                    do ispec=1,dust_nr_species
+                       mcscat_phasefunc(idir,ispec) =                &
+                            anisoscat_phasefunc(inu,ispec,costheta)
+                    enddo
+                 enddo
+              endif
+              do idir=1,mcscat_nrdirs
+                 do ispec=1,dust_nr_species
+                    mcscat_scatsrc_iquv(inu,index,1,idir) =          &
+                         mcscat_scatsrc_iquv(inu,index,1,idir) +     &
+                         mcscat_phasefunc(idir,ispec) * flux *       &
+                         dustdens(ispec,index) * kappa_s(inu,ispec) / fourpi
+                 enddo
+              enddo
+           elseif((scattering_mode.eq.4).or.(scattering_mode.eq.5)) then
+              !
+              ! Full polarized scattering source.
+              !
+              photpkg%E    = flux
+              photpkg%Q    = 0.d0
+              photpkg%U    = 0.d0
+              photpkg%V    = 0.d0
+              photpkg%n(1) = ray_cart_dirx
+              photpkg%n(2) = ray_cart_diry
+              photpkg%n(3) = ray_cart_dirz
+              call polarization_make_s_vector(photpkg%n,photpkg%s)
+              if(dust_2daniso) then
+                 if(mcscat_nrdirs.ne.dust_2daniso_nphi+1) stop 2067
+                 levent = sqrt(ray_cart_x**2+ray_cart_y**2)
+                 if(levent.gt.0.d0) then
+                    cosphievent  = ray_cart_x/levent
+                    sinphievent  = ray_cart_y/levent
+                    xbk          = photpkg%n(1)
+                    ybk          = photpkg%n(2)
+                    photpkg%n(1) =  cosphievent * xbk + sinphievent * ybk
+                    photpkg%n(2) = -sinphievent * xbk + cosphievent * ybk
+                    xbk          = photpkg%s(1)
+                    ybk          = photpkg%s(2)
+                    photpkg%s(1) =  cosphievent * xbk + sinphievent * ybk
+                    photpkg%s(2) = -sinphievent * xbk + cosphievent * ybk
+                 endif
+                 deltaphi = twopi / dust_2daniso_nphi
+                 cosdphi  = cos(deltaphi)
+                 sindphi  = sin(deltaphi)
+              endif
+              do idir=1,mcscat_nrdirs
+                 do ispec=1,dust_nr_species
+                    call polarization_randomorient_scatsource(photpkg, &
+                         mcscat_dirs(:,idir),mcscat_svec(:,idir),      &
+                         scat_munr,scat_mui_grid(:),                   &
+                         zmatrix(:,inu,1,ispec),                       &
+                         zmatrix(:,inu,2,ispec),                       &
+                         zmatrix(:,inu,3,ispec),                       &
+                         zmatrix(:,inu,4,ispec),                       &
+                         zmatrix(:,inu,5,ispec),                       &
+                         zmatrix(:,inu,6,ispec),src4)
+                    mcscat_scatsrc_iquv(inu,index,1:4,idir) =          &
+                         mcscat_scatsrc_iquv(inu,index,1:4,idir) +     &
+                         dustdens(ispec,index) * src4(1:4)
+                 enddo
+                 if(dust_2daniso) then
+                    xbk = photpkg%n(1)
+                    ybk = photpkg%n(2)
+                    photpkg%n(1) =  cosdphi * xbk - sindphi * ybk
+                    photpkg%n(2) =  sindphi * xbk + cosdphi * ybk
+                    xbk = photpkg%s(1)
+                    ybk = photpkg%s(2)
+                    photpkg%s(1) =  cosdphi * xbk - sindphi * ybk
+                    photpkg%s(2) =  sindphi * xbk + cosdphi * ybk
+                 endif
+              enddo
+           endif
+           luminosity = luminosity * exp(-dtau)
+        enddo
+     enddo
+  enddo
+  !$OMP END PARALLEL DO
+  !
+end subroutine montecarlo_add_direct_stellar_scatsrc
+
+
+!--------------------------------------------------------------------------
+!         DETERMINISTIC DIRECT STELLAR HEATING
+!
+! Add the absorbed luminosity of direct stellar photons to mc_cumulener for
+! a regular spherical grid with one central star. This replaces the noisy
+! continuous absorption estimator on the first stellar flight only; later
+! scattered/thermal paths remain Monte Carlo.
+!--------------------------------------------------------------------------
+subroutine montecarlo_add_direct_stellar_heating(params,did_add)
+  implicit none
+  type(mc_params) :: params
+  logical, intent(out) :: did_add
+  integer :: inu,ir,itheta,iphi,ispec,index,icell
+  doubleprecision :: alpha_a_tot_dir,alpha_s_tot_dir,alpha_tot
+  doubleprecision :: alpha_a_ispec,dtau,ds,xp1,luminosity,lum0
+  doubleprecision :: angfrac,mu1,mu2,dphi,star_offset,origin_tol
+  doubleprecision :: cumen,entotal,tempav
+  !
+  did_add = .false.
+  !
+  if(.not.allocated(mc_cumulener)) return
+  if(.not.allocated(dusttemp)) return
+  if(.not.allocated(cellvolume)) return
+  if(.not.allocated(star_spec)) return
+  if(.not.allocated(freq_dnu)) return
+  if(.not.allocated(kappa_a)) return
+  if(.not.allocated(kappa_s)) return
+  if(incl_quantum.ne.0) return
+  if((igrid_coord.lt.100).or.(igrid_coord.ge.200)) return
+  if(amr_style.ne.0) return
+  if(igrid_mirror.eq.1) return
+  if(nstars.ne.1) return
+  if(star_lum(1).le.0.d0) return
+  if(amr_grid_nx.le.0) return
+  if(amr_grid_ny.le.0) return
+  if(amr_grid_nz.le.0) return
+  !
+  star_offset = sqrt(star_pos(1,1)**2+star_pos(2,1)**2+star_pos(3,1)**2)
+  origin_tol  = 1d-12 * max(1.d0,amr_grid_xi(amr_grid_nx+1,1))
+  if(star_offset.gt.origin_tol) return
+  !
+  did_add = .true.
+  write(stdo,*) 'MC variance reduction: deterministic direct stellar heating enabled.'
+  write(stdo,*) '  Applies to regular spherical grid, central star, no quantum heating.'
+  if(star_sphere) then
+     write(stdo,*) '  Direct heating uses point-star attenuation; finite star MC is kept for later paths.'
+  endif
+  call flush(stdo)
+  !
+  !$OMP PARALLEL DO SCHEDULE(static) DEFAULT(shared)                         &
+  !$OMP& PRIVATE(iphi,ir,inu,ispec,index,mu1,mu2,dphi,angfrac,lum0)          &
+  !$OMP& PRIVATE(luminosity,alpha_a_tot_dir,alpha_s_tot_dir,alpha_tot)       &
+  !$OMP& PRIVATE(alpha_a_ispec,dtau,ds,xp1)
+  do itheta=1,amr_grid_ny
+     mu1 = cos(amr_grid_xi(itheta,2))
+     mu2 = cos(amr_grid_xi(itheta+1,2))
+     do iphi=1,amr_grid_nz
+        dphi    = amr_grid_xi(iphi+1,3) - amr_grid_xi(iphi,3)
+        angfrac = (mu1 - mu2) * dphi / fourpi
+        if(angfrac.gt.0.d0) then
+           do inu=1,freq_nr
+              lum0 = pi * star_spec(inu,1) * fourpi * star_r(1)**2 * freq_dnu(inu)
+              luminosity = lum0 * angfrac
+              if(luminosity.gt.0.d0) then
+                 do ir=1,amr_grid_nx
+                    index = ir + (itheta-1)*amr_grid_nx +       &
+                         (iphi-1)*amr_grid_nx*amr_grid_ny
+                    ds = amr_grid_xi(ir+1,1) - amr_grid_xi(ir,1)
+                    !
+                    alpha_a_tot_dir = 0.d0
+                    alpha_s_tot_dir = 0.d0
+                    do ispec=1,dust_nr_species
+                       alpha_a_tot_dir = alpha_a_tot_dir +      &
+                            dustdens(ispec,index) * kappa_a(inu,ispec)
+                       alpha_s_tot_dir = alpha_s_tot_dir +      &
+                            dustdens(ispec,index) * kappa_s(inu,ispec)
+                    enddo
+                    alpha_tot = alpha_a_tot_dir + alpha_s_tot_dir
+                    !
+                    if(alpha_tot.gt.0.d0) then
+                       dtau = alpha_tot * ds
+                       if(dtau.lt.1d-6) then
+                          xp1 = dtau
+                       else
+                          xp1 = 1.d0 - exp(-dtau)
+                       endif
+                       do ispec=1,dust_nr_species
+                          alpha_a_ispec = dustdens(ispec,index) * kappa_a(inu,ispec)
+                          mc_cumulener(ispec,index) = mc_cumulener(ispec,index) + &
+                               luminosity * xp1 * alpha_a_ispec / alpha_tot
+                       enddo
+                       luminosity = luminosity * exp(-dtau)
+                    endif
+                 enddo
+              endif
+           enddo
+        endif
+     enddo
+  enddo
+  !$OMP END PARALLEL DO
+  !
+  if(params%itempdecoup.eq.1) then
+     !$OMP PARALLEL DO SCHEDULE(static) DEFAULT(shared)                      &
+     !$OMP& PRIVATE(index,ispec,cumen)
+     do icell=1,nrcells
+        index = cellindex(icell)
+        do ispec=1,dust_nr_species
+           if(mc_cumulener(ispec,index).gt.0.d0) then
+              cumen = mc_cumulener(ispec,index) /                           &
+                   (dustdens(ispec,index) * cellvolume(index))
+              dusttemp(ispec,index) = compute_dusttemp_energy_bd(cumen,ispec)
+           else
+              dusttemp(ispec,index) = 0.d0
+           endif
+        enddo
+     enddo
+     !$OMP END PARALLEL DO
+  else
+     !$OMP PARALLEL DO SCHEDULE(static) DEFAULT(shared)                      &
+     !$OMP& PRIVATE(index,ispec,entotal,tempav)
+     do icell=1,nrcells
+        index = cellindex(icell)
+        entotal = 0.d0
+        do ispec=1,dust_nr_species
+           entotal = entotal + mc_cumulener(ispec,index)
+        enddo
+        if(entotal.gt.0.d0) then
+           tempav = compute_dusttemp_coupled_bd(dust_nr_species,            &
+                entotal,dustdens(1,index),cellvolume(index))
+        else
+           tempav = 0.d0
+        endif
+        do ispec=1,dust_nr_species
+           dusttemp(ispec,index) = tempav
+        enddo
+     enddo
+     !$OMP END PARALLEL DO
+  endif
+  !
+  if((params%ifast.ne.0).and.allocated(mc_cumulener_bk)) then
+     mc_cumulener_bk(:,:) = mc_cumulener(:,:)
+  endif
+  !
+end subroutine montecarlo_add_direct_stellar_heating
+
+
+!--------------------------------------------------------------------------
+!         USER-CONTROLLED AZIMUTHAL COARSENING OF mcscat_scatsrc_iquv
+!
+! Averages the (Stokes, direction) scattering source over blocks of `coarsen`
+! consecutive phi cells. Use to suppress per-cell Poisson noise in scattered
+! light images when the photon-per-cell count is low. Preserves real
+! azimuthal structure on scales coarser than the block size.
+!
+! Restricted to regular spherical grids (no AMR). For other grids the call
+! returns without action.
+!--------------------------------------------------------------------------
+subroutine montecarlo_coarsen_scatsrc_phi(coarsen)
+  implicit none
+  integer, intent(in) :: coarsen
+  integer :: nx,ny,nz,ix,iy,iz,iz_lo,iz_hi,n_in_bin
+  integer :: inu,idir,index
+  doubleprecision :: avg(1:4)
+  !
+  if(coarsen.le.1) return
+  if(.not.allocated(mcscat_scatsrc_iquv)) return
+  if((igrid_coord.lt.100).or.(igrid_coord.ge.200)) return
+  if(amr_style.ne.0) return
+  if(igrid_mirror.eq.1) return
+  !
+  nx = amr_grid_nx
+  ny = amr_grid_ny
+  nz = amr_grid_nz
+  if(nx.le.0.or.ny.le.0.or.nz.le.1) return
+  !
+  write(stdo,*) 'MC variance reduction: user-set phi coarsening, coarsen=',coarsen
+  call flush(stdo)
+  !
+  !$OMP PARALLEL DO SCHEDULE(static) DEFAULT(shared)                         &
+  !$OMP& PRIVATE(idir,iy,ix,iz_lo,iz_hi,n_in_bin,iz,index,avg)               &
+  !$OMP& COLLAPSE(2)
+  do inu=1,mc_nrfreq
+     do idir=1,mcscat_nrdirs
+        do iy=1,ny
+           do ix=1,nx
+              do iz_lo=1,nz,coarsen
+                 iz_hi = min(iz_lo + coarsen - 1, nz)
+                 n_in_bin = iz_hi - iz_lo + 1
+                 avg(:) = 0.d0
+                 do iz=iz_lo,iz_hi
+                    index = ix + (iy-1)*nx + (iz-1)*nx*ny
+                    avg(1:4) = avg(1:4) + mcscat_scatsrc_iquv(inu,index,1:4,idir)
+                 enddo
+                 avg(1:4) = avg(1:4) / dble(n_in_bin)
+                 do iz=iz_lo,iz_hi
+                    index = ix + (iy-1)*nx + (iz-1)*nx*ny
+                    mcscat_scatsrc_iquv(inu,index,1:4,idir) = avg(1:4)
+                 enddo
+              enddo
+           enddo
+        enddo
+     enddo
+  enddo
+  !$OMP END PARALLEL DO
+  !
+end subroutine montecarlo_coarsen_scatsrc_phi
+
+
+!--------------------------------------------------------------------------
+!         PEELED-OFF (NEXT-EVENT) SCATTERING ESTIMATOR
+!
+! Add the deterministic contribution of a single MC scattering event directly
+! to the image, bypassing the per-cell mcscat_scatsrc_iquv accumulator. Called
+! from walk_cells_scat at every scattering event when the peeled-off estimator
+! is active (mc_peeledoff_active=.true.).
+!
+! The contribution per event for an observer at infinity is
+!
+!     delta I_nu(pixel) = ener * P_phys(cos theta_obs) * exp(-tau_obs)
+!                                                       / (pdx*pdy)
+!
+! where:
+!   ener           is the photon-packet energy at the scattering point
+!                  (already reduced by continuous absorption along the path);
+!   P_phys         is the phase function evaluated against the observer dir,
+!                  normalised so that integral P_phys dOmega = 1, averaged
+!                  over dust species with weights alpha_s(ispec)/alpha_s_tot;
+!   tau_obs        is the extinction (abs+scat) optical depth from the
+!                  scattering point to the grid boundary along the observer
+!                  direction; the photon escapes to infinity afterwards;
+!   pdx*pdy        is the pixel area (cm^2) for an observer at infinity.
+!
+! The phase function uses alpha_s/alpha_s_tot from walk_cells_scat (set on
+! entry to that routine for the current cell).
+!
+! The tau-walk reuses amrray_find_next_location_spher/_cart. To avoid
+! disturbing the MC photon's amrray state, the routine saves the relevant
+! ray + amrray globals on entry and restores them on exit.
+!
+! Modes 1 (isotropic), 2 (HG), 3 (tabulated phase) are supported. For modes
+! 4 and 5 (polarised) we currently use the same scalar treatment as mode 3
+! (the Stokes Q,U,V channels of the peel-off accumulator are left at zero
+! for now; a polarised next-event estimator is left for a follow-up).
+!
+! Activation conditions are checked once in camera_make_rect_image and
+! cached in mc_peeledoff_active; here we only check the runtime invariants
+! that can change per call (ray_index, alpha_s_tot, the image array).
+!--------------------------------------------------------------------------
+subroutine montecarlo_peeledoff_scatsrc(inu,ener_event)
+  use amrray_module
+  implicit none
+  integer, intent(in) :: inu
+  doubleprecision, intent(in) :: ener_event
+  !
+  doubleprecision :: dxv,dyv,dzv,px_im,py_im
+  doubleprecision :: ix_real,iy_real
+  integer :: ix,iy,ispec
+  doubleprecision :: costheta_obs,P_phys,g
+  doubleprecision :: tau_obs,exp_tau_obs,delta_I
+  doubleprecision :: alpha_a_loc,alpha_s_loc,alpha_ext_loc
+  integer :: walk_ierror
+  logical :: walk_arrived
+  !
+  ! Saved MC state
+  !
+  doubleprecision :: saved_x,saved_y,saved_z
+  doubleprecision :: saved_dirx,saved_diry,saved_dirz
+  doubleprecision :: saved_dsend,saved_ds
+  integer :: saved_index,saved_indexnext
+  integer :: saved_ix_curr,saved_iy_curr,saved_iz_curr
+  integer :: saved_ix_next,saved_iy_next,saved_iz_next
+  integer :: saved_icross,saved_ispherehit
+  type(amr_branch), pointer :: saved_cell,saved_nextcell
+  !
+  ! tau_obs_max: peel-off contribution scales with exp(-tau_obs); past ~15
+  ! the contribution is below 1e-6 of unattenuated and is dominated by
+  ! floating-point noise. Stop the walk early to save a lot of work.
+  ! peel_maxsteps: per the grid in use a single ray cannot cross more than
+  ! N_r+N_theta+N_phi cells (~10^4 for any reasonable grid). 4*N_cells_max
+  ! is a generous bound and turns true runaway loops into a fast abort.
+  ! tiny_ds_max: tolerate a handful of zero-length amrray returns (these
+  ! happen at cell-wall coincidences) but bail if we are stuck.
+  doubleprecision, parameter :: tau_obs_max = 15.d0
+  doubleprecision, parameter :: peel_ds_eps  = 1d-12
+  integer, parameter :: peel_maxsteps = 20000
+  integer, parameter :: tiny_ds_max  = 50
+  integer :: nstep,image_inu,tiny_ds_count
+  logical :: ray_blocked
+  !
+  ! Fast-path guards
+  !
+  if(.not.mc_peeledoff_active)                          return
+  if(.not.allocated(mc_peeledoff_iquv))                 return
+  if(ray_index.lt.1)                                    return
+  if(alpha_s_tot.le.0.d0)                               return
+  !
+  ! Map MC frequency index to the image frequency slot. In Method 1
+  ! (camera_mcscat_monochromatic=.false.) the MC ranges over all camera
+  ! frequencies in a single run and ray_inu matches the image freq slot.
+  ! In Method 2 (camera_mcscat_monochromatic=.true.) the MC always sees
+  ! ray_inu=1 and the camera tells us the image freq slot via
+  ! mc_peeledoff_inu_camera.
+  !
+  if(mc_peeledoff_inu_camera.gt.0) then
+     image_inu = mc_peeledoff_inu_camera
+  else
+     image_inu = inu
+  endif
+  if((image_inu.lt.1).or.(image_inu.gt.mc_peeledoff_nfreq)) return
+  !
+  ! Step 1: project the scattering point onto the image plane and find the pixel.
+  !
+  dxv   = ray_cart_x - mc_peeledoff_cx
+  dyv   = ray_cart_y - mc_peeledoff_cy
+  dzv   = ray_cart_z - mc_peeledoff_cz
+  px_im = dxv*mc_peeledoff_ex(1) + dyv*mc_peeledoff_ex(2) + dzv*mc_peeledoff_ex(3)
+  py_im = dxv*mc_peeledoff_ey(1) + dyv*mc_peeledoff_ey(2) + dzv*mc_peeledoff_ey(3)
+  ix_real = (px_im - mc_peeledoff_xref)/mc_peeledoff_pdx + 0.5d0*(mc_peeledoff_nx+1)
+  iy_real = (py_im - mc_peeledoff_yref)/mc_peeledoff_pdy + 0.5d0*(mc_peeledoff_ny+1)
+  ix = nint(ix_real)
+  iy = nint(iy_real)
+  if((ix.lt.1).or.(ix.gt.mc_peeledoff_nx)) return
+  if((iy.lt.1).or.(iy.gt.mc_peeledoff_ny)) return
+  !
+  ! Step 2: evaluate the phase function (alpha_s-weighted average over species).
+  !         P_phys is normalised so that integral P_phys dOmega = 1.
+  !
+  costheta_obs = ray_cart_dirx*mc_peeledoff_dir(1) +                      &
+                 ray_cart_diry*mc_peeledoff_dir(2) +                      &
+                 ray_cart_dirz*mc_peeledoff_dir(3)
+  if(costheta_obs.gt. 1.d0) costheta_obs =  1.d0
+  if(costheta_obs.lt.-1.d0) costheta_obs = -1.d0
+  !
+  if(scattering_mode.eq.1) then
+     !
+     ! Isotropic
+     !
+     P_phys = 1.d0/fourpi
+  elseif(scattering_mode.eq.2) then
+     !
+     ! Henyey-Greenstein, species-averaged with alpha_s weights.
+     !
+     P_phys = 0.d0
+     do ispec=1,dust_nr_species
+        g = kappa_g(ray_inu,ispec)
+        P_phys = P_phys + (alpha_s(ispec)/alpha_s_tot) *                  &
+                          henyeygreenstein_phasefunc(g,costheta_obs)
+     enddo
+     P_phys = P_phys / fourpi
+  else
+     !
+     ! Modes 3, 4, 5: use the tabulated scalar phase function.
+     ! Polarisation is dropped in this initial implementation.
+     !
+     P_phys = 0.d0
+     do ispec=1,dust_nr_species
+        P_phys = P_phys + (alpha_s(ispec)/alpha_s_tot) *                  &
+                          anisoscat_phasefunc(ray_inu,ispec,costheta_obs)
+     enddo
+     P_phys = P_phys / fourpi
+  endif
+  if(P_phys.le.0.d0) return
+  !
+  ! Step 3: save the MC ray + amrray state. This routine will repeatedly
+  !         call amrray_find_next_location_* with a fresh direction (toward
+  !         the observer), which overwrites the global ray_* and amrray_*
+  !         state. We restore everything before returning.
+  !
+  saved_x        = ray_cart_x
+  saved_y        = ray_cart_y
+  saved_z        = ray_cart_z
+  saved_dirx     = ray_cart_dirx
+  saved_diry     = ray_cart_diry
+  saved_dirz     = ray_cart_dirz
+  saved_index    = ray_index
+  saved_indexnext= ray_indexnext
+  saved_dsend    = ray_dsend
+  saved_ds       = ray_ds
+  saved_ix_curr  = amrray_ix_curr
+  saved_iy_curr  = amrray_iy_curr
+  saved_iz_curr  = amrray_iz_curr
+  saved_ix_next  = amrray_ix_next
+  saved_iy_next  = amrray_iy_next
+  saved_iz_next  = amrray_iz_next
+  saved_icross   = amrray_icross
+  saved_ispherehit = amrray_ispherehit
+  if(amr_tree_present) then
+     saved_cell     => amrray_cell
+     saved_nextcell => amrray_nextcell
+  else
+     nullify(saved_cell)
+     nullify(saved_nextcell)
+  endif
+  !
+  ! Step 4: walk from the scattering point along the observer direction,
+  !         accumulating extinction (absorption + scattering) tau.
+  !
+  ray_cart_dirx = mc_peeledoff_dir(1)
+  ray_cart_diry = mc_peeledoff_dir(2)
+  ray_cart_dirz = mc_peeledoff_dir(3)
+  ray_dsend     = 1d99
+  tau_obs       = 0.d0
+  walk_arrived  = .false.
+  walk_ierror   = 0
+  nstep         = 0
+  ray_blocked   = .false.
+  tiny_ds_count = 0
+  !
+  do
+     nstep = nstep + 1
+     if(nstep.gt.peel_maxsteps) then
+        !
+        ! Runaway loop: we cannot say what tau_obs really is, so treat
+        ! the event as blocked rather than depositing exp(-tau_so_far)
+        ! (an over-estimate equal to the missing tail of the integral).
+        !
+        ray_blocked = .true.
+        exit
+     endif
+     !
+     if(igrid_coord.lt.100) then
+        call amrray_find_next_location_cart(ray_dsend,                    &
+             ray_cart_x,ray_cart_y,ray_cart_z,                            &
+             ray_cart_dirx,ray_cart_diry,ray_cart_dirz,                   &
+             ray_index,ray_indexnext,ray_ds,walk_arrived,walk_ierror)
+     elseif(igrid_coord.lt.200) then
+        call amrray_find_next_location_spher(ray_dsend,                   &
+             ray_cart_x,ray_cart_y,ray_cart_z,                            &
+             ray_cart_dirx,ray_cart_diry,ray_cart_dirz,                   &
+             ray_index,ray_indexnext,ray_ds,walk_arrived,walk_ierror)
+     else
+        exit
+     endif
+     !
+     if(walk_ierror.ne.0) exit
+     !
+     ! Detect rays whose line of sight is blocked before reaching the
+     ! observer: a hit on a stellar sphere (amrray_ispherehit<0) means
+     ! the photon is absorbed by the star; an inward exit through the
+     ! inner radial boundary (walk_arrived with ray_indexnext<=0 while
+     ! we still point toward the origin) means the ray enters the
+     ! central cavity and we cannot accurately continue its tau walk
+     ! through the gap. In both cases, the peeled-off contribution
+     ! must be suppressed; otherwise we deposit an artificially
+     ! unattenuated (~ener/pixel_area) spike that shows up as bright
+     ! hot pixels near the star.
+     !
+     if(amrray_ispherehit.lt.0) then
+        ray_blocked = .true.
+        exit
+     endif
+     !
+     ! Accumulate optical depth in the cell we just crossed.
+     !
+     if(ray_index.ge.1) then
+        alpha_a_loc = 0.d0
+        alpha_s_loc = 0.d0
+        do ispec=1,dust_nr_species
+           alpha_a_loc = alpha_a_loc + dustdens(ispec,ray_index)*kappa_a(ray_inu,ispec)
+           alpha_s_loc = alpha_s_loc + dustdens(ispec,ray_index)*kappa_s(ray_inu,ispec)
+        enddo
+        alpha_ext_loc = alpha_a_loc + alpha_s_loc
+        if(ray_ds.gt.peel_ds_eps) then
+           tau_obs = tau_obs + alpha_ext_loc*ray_ds
+           tiny_ds_count = 0
+        else
+           tiny_ds_count = tiny_ds_count + 1
+           if(tiny_ds_count.gt.tiny_ds_max) then
+              !
+              ! Stuck in tiny-ds loop: tau is unreliable, suppress event.
+              !
+              ray_blocked = .true.
+              exit
+           endif
+        endif
+        if(tau_obs.ge.tau_obs_max) exit  ! exp(-tau_max) ~ 3e-7, OK to use
+     endif
+     !
+     ! Move to the next cell.
+     !
+     ray_index = ray_indexnext
+     if(ray_index.le.0) then
+        !
+        ! Out of grid. Distinguish a successful escape to infinity (outer
+        ! boundary -> ray continues to observer, deposit normally) from
+        ! an inward exit into the central cavity (we cannot continue the
+        ! tau walk reliably across the gap -> suppress this event).
+        !
+        if(igrid_coord.ge.100.and.igrid_coord.lt.200) then
+           if(ray_cart_x*ray_cart_x +                                     &
+              ray_cart_y*ray_cart_y +                                     &
+              ray_cart_z*ray_cart_z .lt.                                  &
+              amr_grid_xi(1,1)*amr_grid_xi(1,1)*1.001d0) then
+              ray_blocked = .true.
+           endif
+        endif
+        exit
+     endif
+     if(walk_arrived) exit
+     !
+     ! Refresh the regular-grid cell indices that amrray_find_next_location_*
+     ! reads on entry. For the AMR tree case the routine itself rebuilds
+     ! amrray_cell from ray_indexcurr.
+     !
+     if(.not.amr_tree_present) then
+        call amr_regular_get_ixyz(ray_index,amrray_ix_curr,amrray_iy_curr,amrray_iz_curr)
+     endif
+  enddo
+  !
+  ! Step 5: restore the MC ray + amrray state.
+  !
+  ray_cart_x       = saved_x
+  ray_cart_y       = saved_y
+  ray_cart_z       = saved_z
+  ray_cart_dirx    = saved_dirx
+  ray_cart_diry    = saved_diry
+  ray_cart_dirz    = saved_dirz
+  ray_index        = saved_index
+  ray_indexnext    = saved_indexnext
+  ray_dsend        = saved_dsend
+  ray_ds           = saved_ds
+  amrray_ix_curr   = saved_ix_curr
+  amrray_iy_curr   = saved_iy_curr
+  amrray_iz_curr   = saved_iz_curr
+  amrray_ix_next   = saved_ix_next
+  amrray_iy_next   = saved_iy_next
+  amrray_iz_next   = saved_iz_next
+  amrray_icross    = saved_icross
+  amrray_ispherehit= saved_ispherehit
+  if(amr_tree_present) then
+     amrray_cell     => saved_cell
+     amrray_nextcell => saved_nextcell
+  endif
+  !
+  ! Step 6: compute the peel-off contribution and add it to the image
+  !         accumulator with an atomic update (the MC photon loop is
+  !         OpenMP parallel; multiple threads may target the same pixel).
+  !
+  if(walk_ierror.ne.0) return
+  if(ray_blocked)      return
+  !
+  exp_tau_obs = exp(-tau_obs)
+  delta_I = ener_event * P_phys * exp_tau_obs /                            &
+            (mc_peeledoff_pdx * mc_peeledoff_pdy)
+  !
+  !$OMP ATOMIC
+  mc_peeledoff_iquv(ix,iy,image_inu,1) = mc_peeledoff_iquv(ix,iy,image_inu,1) + delta_I
+  !
+end subroutine montecarlo_peeledoff_scatsrc
+
+
 
 !--------------------------------------------------------------------------
 !         WALK THE ENTIRE RANDOM WALK UNTIL PHOTON LEAVES SYSTEM
@@ -4235,7 +5088,7 @@ subroutine walk_full_path_bjorkmanwood(params,ierror)
   integer :: ispec,iqactive,istar,icell,itemplate
   integer :: ibnd,bc_idir,bc_ilr,ix,iy,iz,illum
   integer :: index_prev,count_samecell,iddr,idim,icoord
-  logical :: ok,arrived,therm,usesphere,nospheres,incell
+  logical :: ok,arrived,therm,usesphere,nospheres,incell,first_event
   type(amr_branch), pointer :: acell
   !$ logical::continue
   !
@@ -4256,6 +5109,7 @@ subroutine walk_full_path_bjorkmanwood(params,ierror)
   !
   iqactive = 0
   mc_photon_destroyed = .false.
+  mc_therm_skip_first_stellar_heating = .false.
   !
   ! First choose whether to launch the photon from (one of) the star(s) or
   ! from the external radiation field or from inside the grid (due to the
@@ -4323,6 +5177,10 @@ subroutine walk_full_path_bjorkmanwood(params,ierror)
            endif
         endif
         !
+        if(mc_therm_direct_stellar_heating) then
+           mc_therm_skip_first_stellar_heating = .true.
+        endif
+        !
         ! If we have the spherical star mode switched on, then 
         ! switch it on here as well
         !
@@ -4388,30 +5246,9 @@ subroutine walk_full_path_bjorkmanwood(params,ierror)
            !
            ray_index = 0
            !
-           ! Now determine a random direction for the photon. One must,
-           ! however, be careful here because the direction is NOT simply a 3-D
-           ! random direction with all inward directions rejected.  The thing
-           ! is this: the intensity of a blackbody surface is the same at all
-           ! inclinations. However, if one would simply use a normal random
-           ! direction (using montecarlo_randomdir()) then one would see a
-           ! brighter intensity as the surface is viewed under a more grazing
-           ! inclination. This is incorrect.  So to compensate for this one
-           ! must have the change of a photon being emitted in direction
-           ! mu=cos(theta) to be proportional to mu. This is Lambertian emission.
+           ! Lambertian emission from the stellar surface: draw mu with
+           ! P(mu) proportional to mu, then rotate into the local normal.
            !
-           ! NOTE: I have been confused again, here, with this sqrt(rn). But it
-           ! is indeed correct! The example that made me understand again why
-           ! this is so is the example of a transport company with fast trucks,
-           ! sending out per day 10 trucks, and a firm with slow trucks, also
-           ! sending out per day 10 trucks. Both firms have the same flux of
-           ! goods, even though firm2 has slow trucks. Firm2 just requires more
-           ! trucks to keep the flux going. That is why photons with mu\simeq 0
-           ! (slow) would carry the same flux as photons with mu\simeq 1 (fast)
-           ! if they would be emitted equally often. Since we know that
-           ! mu\simeq 0 photons carry less flux, they must be emitted less
-           ! often. Hence P(mu)=mu, i.e. Pcum(mu)=mu^2, or so to say:
-           ! mu=sqrt(Pcum)=sqrt(rn).
-           ! 
            rn            = ran2(iseed)
            ray_cart_dirx = sqrt(rn)
            dum           = twopi*ran2(iseed)
@@ -4447,10 +5284,12 @@ subroutine walk_full_path_bjorkmanwood(params,ierror)
            !
            if(star_fraclum(istar).eq.1.d0) then
               !
-              ! Pure random direction in 4*pi
+              ! Stratified direction in 4*pi
               !
-              call montecarlo_randomdir(ray_cart_dirx,ray_cart_diry,  &
-                                        ray_cart_dirz)
+              call montecarlo_randomdir_stratphi(ray_cart_dirx,ray_cart_diry,    &
+                                                 ray_cart_dirz,                  &
+                                                 mc_scat_iphot_strat,            &
+                                                 mc_scat_nphot_strat)
            else
               !
               ! Focused toward the model grid (the star lies outside the grid)
@@ -5013,19 +5852,29 @@ subroutine walk_full_path_bjorkmanwood(params,ierror)
   !
   ok = .true.
   count_samecell = 0
+  first_event = .true.
   do while(ok)
      !
      ! Backup the current index
      !
      index_prev = ray_index
      !
-     ! Get a random tau
+     ! Get a random tau; stratify the first (stellar) leg to suppress spoke noise.
      !
-     taupath = -log(1.d0-ran2(iseed))
+     if(first_event) then
+        rn = min(0.9999999d0, (dble(mc_scat_strat_tau) + ran2(iseed)) / dble(mc_scat_N_tau))
+        taupath = -log(1.d0 - rn)
+        first_event = .false.
+     else
+        taupath = -log(1.d0-ran2(iseed))
+     endif
      !
      ! Move photon to next scattering/absorption event
-     ! 
+     !
      call walk_cells_thermal(params,taupath,iqactive,arrived,therm,ispec,ierror)
+     if(mc_therm_skip_first_stellar_heating) then
+        mc_therm_skip_first_stellar_heating = .false.
+     endif
      !
      ! If error, return
      !
@@ -5549,7 +6398,7 @@ subroutine walk_full_path_scat(params,inu,ierror)
   double precision :: dir_perp,dir_planex,dir_planey,dummy
   integer :: ispec,iqactive,istar,icell,itemplate,iscatevent
   integer :: ibnd,bc_idir,bc_ilr,ix,iy,iz,illum,ierr
-  logical :: ok,arrived,usesphere,todo_photpkg
+  logical :: ok,arrived,usesphere,todo_photpkg,first_event
   type(amr_branch), pointer :: acell
   !
   ! Do checks
@@ -5571,6 +6420,7 @@ subroutine walk_full_path_scat(params,inu,ierror)
   mc_photon_destroyed = .false.
   ray_inu  = inu
   todo_photpkg = .true.
+  mc_scat_skip_first_stellar_scatsrc = .false.
   !
   ! First choose whether to launch the photon from (one of) the star(s) or
   ! from the external radiation field or from inside the grid (due to the
@@ -5614,6 +6464,9 @@ subroutine walk_full_path_scat(params,inu,ierror)
               write(stdo,*) 'INTERNAL ERROR with 0 stars in Monte Carlo module'
               stop
            endif
+        endif
+        if(mc_scat_direct_stellar_scatsrc) then
+           mc_scat_skip_first_stellar_scatsrc = .true.
         endif
         !
         ! If we have the spherical star mode switched on, then 
@@ -5681,30 +6534,9 @@ subroutine walk_full_path_scat(params,inu,ierror)
            !
            ray_index = 0
            !
-           ! Now determine a random direction for the photon. One must,
-           ! however, be careful here because the direction is NOT simply a 3-D
-           ! random direction with all inward directions rejected.  The thing
-           ! is this: the intensity of a blackbody surface is the same at all
-           ! inclinations. However, if one would simply use a normal random
-           ! direction (using montecarlo_randomdir()) then one would see a
-           ! brighter intensity as the surface is viewed under a more grazing
-           ! inclination. This is incorrect.  So to compensate for this one
-           ! must have the change of a photon being emitted in direction
-           ! my=cos(theta) to be proportional to mu.
+           ! Lambertian emission from the stellar surface: draw mu with
+           ! P(mu) proportional to mu, then rotate into the local normal.
            !
-           ! NOTE: I have been confused again, here, with this sqrt(rn). But it
-           ! is indeed correct, as far as I know!!  The example that made me
-           ! understand again why this is so is the example of a transport
-           ! company with fast trucks, sending out per day 10 trucks, and a
-           ! firm with slow trucks, also sending out per day 10 trucks. Both
-           ! firms have the same flux of goods, even though firm2 has slow
-           ! trucks. Firm2 just requires more trucks to keep the flux
-           ! going. That is why photons with mu\simeq 0 (slow) would carry the
-           ! same flux as photons with mu\simeq 1 (fast) if they would be
-           ! emitted equally often. Since we know that mu\simeq 0 photons carry
-           ! less flux, they must be emitted less often. Hence P(mu)=mu,
-           ! i.e. Pcum(mu)=mu^2, or so to say: mu=sqrt(Pcum)=sqrt(rn).
-           ! 
            rn            = ran2(iseed)
            ray_cart_dirx = sqrt(rn)
            dum           = twopi*ran2(iseed)
@@ -5740,10 +6572,15 @@ subroutine walk_full_path_scat(params,inu,ierror)
            !
            if(star_fraclum(istar).eq.1.d0) then
               !
-              ! Pure random direction in 4*pi
+              ! Stratified-phi direction: phi is uniformly tiled across [0,2pi)
+              ! using the photon index so every phi bin gets exactly one photon.
+              ! cos(theta) is still drawn randomly.  This eliminates the
+              ! phi-correlated shot noise (radial spoke artifacts) in images.
               !
-              call montecarlo_randomdir(ray_cart_dirx,ray_cart_diry,  &
-                                        ray_cart_dirz)
+              call montecarlo_randomdir_stratphi(ray_cart_dirx,ray_cart_diry, &
+                                                 ray_cart_dirz,               &
+                                                 mc_scat_iphot_strat,         &
+                                                 mc_scat_nphot_strat)
            else
               !
               ! Focused toward the model grid (the star lies outside the grid)
@@ -6191,15 +7028,22 @@ subroutine walk_full_path_scat(params,inu,ierror)
   ok = .true.
   iscatevent = 0
   selectscat_iscat = 1
+  first_event = .true.
 !!  ieventcount = 0         ! For debugging
   do while(ok)
      !
-     ! Get a random tau, this time it is the scattering tau only
+     ! Get a random tau; stratify the first (stellar) leg to suppress spoke noise.
      !
-     taupath = -log(1.d0-ran2(iseed))
+     if(first_event) then
+        rn = min(0.9999999d0, (dble(mc_scat_strat_tau) + ran2(iseed)) / dble(mc_scat_N_tau))
+        taupath = -log(1.d0 - rn)
+        first_event = .false.
+     else
+        taupath = -log(1.d0-ran2(iseed))
+     endif
      !
      ! Move photon to next scattering event
-     ! 
+     !
      call walk_cells_scat(params,taupath,ener,inu,arrived,ispec,ierror)
      !
      ! If error, return
@@ -6316,6 +7160,9 @@ subroutine walk_full_path_scat(params,inu,ierror)
      !
      ! For selectscat: Increase counter
      !
+     if(selectscat_iscat.eq.1) then
+        mc_scat_skip_first_stellar_scatsrc = .false.
+     endif
      selectscat_iscat = selectscat_iscat + 1
      !
      ! Next event
@@ -6340,7 +7187,7 @@ subroutine walk_cells_thermal(params,taupath,iqactive,arrived, &
   doubleprecision :: taupath,fr
   doubleprecision :: tau,dtau,albedo,absorb,dum,scatsrc0,costheta
   doubleprecision :: dexp,dener,ds,dummy,alpha_tot,g,rn,dss,src4(1:4)
-  logical :: ok,arrived,therm
+  logical :: ok,arrived,therm,skip_direct_stellar_heating
   doubleprecision :: prev_x,prev_y,prev_z
   !$ logical::continue
   !
@@ -6353,6 +7200,8 @@ subroutine walk_cells_thermal(params,taupath,iqactive,arrived, &
   !
   mc_photon_destroyed = .false.
   arrived  = .false.
+  skip_direct_stellar_heating = mc_therm_direct_stellar_heating.and.  &
+       mc_therm_skip_first_stellar_heating
   !
   ! In this subroutine we will not make use of the amrray option to
   ! advance only partly within a cell. We will check here if we have
@@ -6512,19 +7361,21 @@ subroutine walk_cells_thermal(params,taupath,iqactive,arrived, &
         !
         ! Add energy to cell
         !
-        dum = absorb * (taupath-tau) * energy / alpha_a_tot
-        if(iqactive.le.0) then
-           do ispec=1,dust_nr_species
-              mc_cumulener(ispec,ray_index) = mc_cumulener(ispec,ray_index) +  &
-                   dum * alpha_a(ispec) 
-           enddo
-        else
-           do ispec=1,dust_nr_species
-              if(dust_quantum(ispec).eq.0) then 
+        if(.not.skip_direct_stellar_heating) then
+           dum = absorb * (taupath-tau) * energy / alpha_a_tot
+           if(iqactive.le.0) then
+              do ispec=1,dust_nr_species
                  mc_cumulener(ispec,ray_index) = mc_cumulener(ispec,ray_index) +  &
-                      dum * alpha_a(ispec) 
-              endif
-           enddo
+                      dum * alpha_a(ispec)
+              enddo
+           else
+              do ispec=1,dust_nr_species
+                 if(dust_quantum(ispec).eq.0) then
+                    mc_cumulener(ispec,ray_index) = mc_cumulener(ispec,ray_index) +  &
+                         dum * alpha_a(ispec)
+                 endif
+              enddo
+           endif
         endif
         !
         ! Add photons to mean intensity of 
@@ -6603,13 +7454,15 @@ subroutine walk_cells_thermal(params,taupath,iqactive,arrived, &
         !
         ! We are in a cell. So add energy to cell
         !
-        dum = absorb * dtau * energy / alpha_a_tot
-        do ispec=1,dust_nr_species
-           if((dust_quantum(ispec).eq.0).or.(iqactive.le.0)) then 
-              mc_cumulener(ispec,ray_index) =                          &
-                   mc_cumulener(ispec,ray_index) + dum * alpha_a(ispec) 
-           endif
-        enddo
+        if(.not.skip_direct_stellar_heating) then
+           dum = absorb * dtau * energy / alpha_a_tot
+           do ispec=1,dust_nr_species
+              if((dust_quantum(ispec).eq.0).or.(iqactive.le.0)) then
+                 mc_cumulener(ispec,ray_index) =                          &
+                      mc_cumulener(ispec,ray_index) + dum * alpha_a(ispec)
+              endif
+           enddo
+        endif
         !
         ! Add photons to mean intensity of 
         ! primary (quantum-heating) photons
@@ -6699,7 +7552,7 @@ subroutine walk_cells_scat(params,taupath,ener,inu,arrived,ispecc,ierror)
   doubleprecision :: taupath,fr,ener,enerav
   doubleprecision :: tau,dtau,dum,dtauabs,dtauscat,xptauabs,xxtauabs
   doubleprecision :: ds,rn,scatsrc0,mnint,dss
-  logical :: ok,arrived
+  logical :: ok,arrived,skip_stellar_direct_scatsrc
   doubleprecision :: prev_x,prev_y,prev_z
   doubleprecision :: costheta,g,phasefunc,dummy,src4(1:4)
   doubleprecision :: axi(1:2,1:3),Ebk,Qbk,Ubk,Vbk
@@ -6719,6 +7572,8 @@ subroutine walk_cells_scat(params,taupath,ener,inu,arrived,ispecc,ierror)
   mc_photon_destroyed = .false.
   arrived  = .false.
   ray_inu  = inu
+  skip_stellar_direct_scatsrc = mc_scat_direct_stellar_scatsrc.and.      &
+       mc_scat_skip_first_stellar_scatsrc.and.(selectscat_iscat.eq.1)
   !
   ! In this subroutine we will not make use of the amrray option to
   ! advance only partly within a cell. We will check here if we have
@@ -7008,7 +7863,9 @@ subroutine walk_cells_scat(params,taupath,ener,inu,arrived,ispecc,ierror)
         !       continuously by the absorption, we must use the average
         !       energy over this ray element, enerav.
         !
-        if((alpha_s_tot.gt.0.d0).and.(allocated(mcscat_scatsrc_iquv))) then
+        if((alpha_s_tot.gt.0.d0).and.(allocated(mcscat_scatsrc_iquv)).and. &
+             (.not.skip_stellar_direct_scatsrc).and.                       &
+             (.not.mc_peeledoff_active)) then
            if(scattering_mode.eq.1) then
               !
               ! Isotropic scattering: simply add the source term
@@ -7309,6 +8166,20 @@ subroutine walk_cells_scat(params,taupath,ener,inu,arrived,ispecc,ierror)
         ray_cart_y = prev_y + fr * ( ray_cart_y - prev_y )
         ray_cart_z = prev_z + fr * ( ray_cart_z - prev_z )
         !
+        ! Peeled-off (next-event) estimator: tally this scattering event
+        ! directly into the image. Only fires when peel-off is active and
+        ! the deterministic first-stellar-scatter is NOT handling this
+        ! event (otherwise we would double-count the first scatter).
+        ! Bypasses the per-cell mcscat_scatsrc_iquv binning so there is
+        ! no cell-level Poisson noise (no radial spokes).
+        !
+        if(mc_peeledoff_active.and.(alpha_s_tot.gt.0.d0).and.              &
+             (.not.skip_stellar_direct_scatsrc).and.                       &
+             (selectscat_iscat.ge.selectscat_iscat_first).and.             &
+             (selectscat_iscat.le.selectscat_iscat_last)) then
+           call montecarlo_peeledoff_scatsrc(ray_inu, ener*xptauabs)
+        endif
+        !
         ! For anisotropic scattering we need to know off which dust species
         ! the photon has scattered. Determine this here, and call it ispecc.
         !
@@ -7412,7 +8283,9 @@ subroutine walk_cells_scat(params,taupath,ener,inu,arrived,ispecc,ierror)
         !       continuously by the absorption, we must use the average
         !       energy over this ray element, enerav.
         !
-        if((alpha_s_tot.gt.0.d0).and.(allocated(mcscat_scatsrc_iquv))) then
+        if((alpha_s_tot.gt.0.d0).and.(allocated(mcscat_scatsrc_iquv)).and. &
+             (.not.skip_stellar_direct_scatsrc).and.                       &
+             (.not.mc_peeledoff_active)) then
            if(scattering_mode.eq.1) then
               !
               ! Isotropic scattering: simply add the source term
@@ -8344,7 +9217,51 @@ subroutine montecarlo_randomdir(dirx,diry,dirz)
   !
 end subroutine montecarlo_randomdir
 
-
+!--------------------------------------------------------------------------
+!  montecarlo_randomdir_stratphi
+!
+!  Like montecarlo_randomdir but stratifies the unit sphere into a
+!  sqrt(nphot) by sqrt(nphot) grid in (mu,phi), with random jitter inside
+!  each bin.
+!
+!  This eliminates the phi-correlated shot noise that causes radial spoke
+!  artifacts in scattered-light images by reducing between-bin variance.
+!
+!  Falls back to a fully random direction if nphot <= 0 (e.g. when called
+!  outside the scattering MC loop where the stratification counter is not set).
+!--------------------------------------------------------------------------
+subroutine montecarlo_randomdir_stratphi(dirx,diry,dirz,iphot,nphot)
+  implicit none
+  doubleprecision, intent(out) :: dirx,diry,dirz
+  integer*8,       intent(in)  :: iphot,nphot
+  doubleprecision :: mu,sintheta,phi
+  integer*8       :: n_strat,i_mu,i_phi,k
+  !
+  if(nphot.le.0_8) then
+     call montecarlo_randomdir(dirx,diry,dirz)
+     return
+  endif
+  !
+  ! 2D stratified sampling over (mu, phi) space.
+  ! Tile the unit sphere uniformly by dividing each axis into n_strat bins,
+  ! where n_strat = floor(sqrt(nphot)).  Photon k maps to bin (i_mu, i_phi)
+  ! via a row-major index that cycles through all n_strat^2 bins.  Within
+  ! each bin a uniform jitter is applied, so the distribution stays correct
+  ! on average while reducing correlated noise along radial spokes.
+  !
+  n_strat  = max(1_8, int(sqrt(dble(nphot)), kind=8))
+  k        = mod(iphot - 1_8, n_strat * n_strat)
+  i_phi    = mod(k, n_strat)
+  i_mu     = k / n_strat
+  mu       = -1.d0 + (2.d0*(dble(i_mu) + ran2(iseed))) / dble(n_strat)
+  sintheta = sqrt(max(0.d0, 1.d0 - mu*mu))
+  phi      = (dble(i_phi) + ran2(iseed)) / dble(n_strat) * twopi
+  !
+  dirx = sintheta * cos(phi)
+  diry = sintheta * sin(phi)
+  dirz = mu
+  !
+end subroutine montecarlo_randomdir_stratphi
 
 !--------------------------------------------------------------------------
 !                           Rotate vector 

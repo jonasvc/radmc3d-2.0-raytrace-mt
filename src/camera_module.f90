@@ -293,7 +293,7 @@ module camera_module
   !
   double precision :: camera_dir(1:3),camera_svec(1:3)
   !
-  ! For 2-D axisymmetric models it might be important to limit the 
+  ! For 2-D axisymmetric models it might be important to limit the
   ! length of a ray segment to avoid too large changes of the phi
   ! (azimuthal) angle of the ray between two cellwall crossings.
   !
@@ -3774,6 +3774,119 @@ subroutine camera_make_rect_image(img,tausurf)
   pdx = 2*camera_image_halfsize_x / (1.d0*camera_image_nx)
   pdy = 2*camera_image_halfsize_y / (1.d0*camera_image_ny)
   !
+  ! ----------------------------------------------------------------------
+  ! Peeled-off (next-event) scattering estimator setup.
+  !
+  ! When mc_peeledoff>0 in radmc3d.inp and the camera setup is compatible
+  ! (single observer direction, observer at infinity, no 2-D axisymmetric
+  ! mode, no AMR, no mirror), we activate the peeled-off estimator. The
+  ! MC then bypasses the per-cell mcscat_scatsrc_iquv binning for events
+  ! at scatter order >= 2 and writes directly into mc_peeledoff_iquv,
+  ! which is added to camera_rect_image_iquv after the ray tracing
+  ! completes. This removes cell-level Poisson noise (the radial-spoke
+  ! artifact) without forcing axisymmetry.
+  !
+  ! The deterministic direct-stellar first-scattering estimator
+  ! (montecarlo_add_direct_stellar_scatsrc) is left in place: its
+  ! contribution is written to mcscat_scatsrc_iquv and is integrated by
+  ! the camera in the normal way. walk_cells_scat skips its own MC
+  ! deposit when peel-off is active, so mcscat_scatsrc_iquv ends up
+  ! containing only the deterministic first-scatter contribution.
+  ! ----------------------------------------------------------------------
+  !
+  mc_peeledoff_active = .false.
+  mc_peeledoff_inu_camera = 0
+  if(allocated(mc_peeledoff_iquv)) deallocate(mc_peeledoff_iquv)
+  ! Note: for scattering_mode==1 (isotropic), camera_dir/camera_svec are
+  ! NOT populated by the camera setup (that block is gated by
+  ! scattering_mode.gt.1). The peel-off therefore derives its observer
+  ! direction and image-plane basis directly from the camera angles
+  ! below, instead of relying on camera_dir/camera_svec. Similarly,
+  ! mcscat_nrdirs may still be 0 here for isotropic scattering (it is
+  ! set to 1 inside montecarlo_init when the MC actually runs), so we
+  ! accept mcscat_nrdirs<=1 and reject only the truly multi-direction
+  ! cases (2-D axisymmetric anisotropic, captured by dust_2daniso).
+  if((mc_peeledoff.gt.0).and.(scattering_mode.ge.1).and.                  &
+       (.not.camera_localobserver).and.(.not.dust_2daniso).and.           &
+       (mcscat_nrdirs.le.1).and.(amr_style.eq.0).and.                     &
+       (igrid_mirror.eq.0).and.                                           &
+       ((igrid_coord.lt.100).or.                                          &
+        ((igrid_coord.ge.100).and.(igrid_coord.lt.200)))) then
+     mc_peeledoff_active = .true.
+     !
+     ! Image-plane basis vectors derived directly from the camera angles
+     ! (so this works for scattering_mode==1, where camera_dir/svec are
+     ! not initialised). The construction matches camera_set_ray's
+     ! R_phi * R_theta * R_posang applied to:
+     !   (1,0,0) -> ex  ("right")
+     !   (0,1,0) -> ey  ("up", a.k.a. svec)
+     !   (0,0,1) -> dir (toward observer at infinity)
+     !
+     dirx = 0.d0
+     diry = 0.d0
+     dirz = 1.d0
+     ybk  = diry
+     zbk  = dirz
+     diry = camera_observer_cos_theta * ybk - camera_observer_sin_theta * zbk
+     dirz = camera_observer_sin_theta * ybk + camera_observer_cos_theta * zbk
+     xbk  = dirx
+     ybk  = diry
+     dirx = camera_observer_cos_phi * xbk + camera_observer_sin_phi * ybk
+     diry =-camera_observer_sin_phi * xbk + camera_observer_cos_phi * ybk
+     !
+     svcx = 0.d0
+     svcy = 1.d0
+     svcz = 0.d0
+     xbk  = svcx
+     ybk  = svcy
+     svcx = camera_pointing_cos_posang * xbk + camera_pointing_sin_posang * ybk
+     svcy =-camera_pointing_sin_posang * xbk + camera_pointing_cos_posang * ybk
+     ybk  = svcy
+     zbk  = svcz
+     svcy = camera_observer_cos_theta * ybk - camera_observer_sin_theta * zbk
+     svcz = camera_observer_sin_theta * ybk + camera_observer_cos_theta * zbk
+     xbk  = svcx
+     ybk  = svcy
+     svcx = camera_observer_cos_phi * xbk + camera_observer_sin_phi * ybk
+     svcy =-camera_observer_sin_phi * xbk + camera_observer_cos_phi * ybk
+     !
+     ! ex = svec x dir
+     !
+     mc_peeledoff_ex(1) = svcy*dirz - svcz*diry
+     mc_peeledoff_ex(2) = svcz*dirx - svcx*dirz
+     mc_peeledoff_ex(3) = svcx*diry - svcy*dirx
+     mc_peeledoff_ey(1) = svcx
+     mc_peeledoff_ey(2) = svcy
+     mc_peeledoff_ey(3) = svcz
+     mc_peeledoff_dir(1) = dirx
+     mc_peeledoff_dir(2) = diry
+     mc_peeledoff_dir(3) = dirz
+     mc_peeledoff_cx     = camera_pointing_position(1)
+     mc_peeledoff_cy     = camera_pointing_position(2)
+     mc_peeledoff_cz     = camera_pointing_position(3)
+     mc_peeledoff_pdx    = pdx
+     mc_peeledoff_pdy    = pdy
+     mc_peeledoff_xref   = camera_zoomcenter_x
+     mc_peeledoff_yref   = camera_zoomcenter_y
+     mc_peeledoff_nx     = camera_image_nx
+     mc_peeledoff_ny     = camera_image_ny
+     mc_peeledoff_nfreq  = camera_nrfreq
+     !
+     allocate(mc_peeledoff_iquv(camera_image_nx,camera_image_ny,           &
+                                camera_nrfreq,1:4),STAT=ierr)
+     if(ierr.ne.0) then
+        write(stdo,*) 'ERROR: Could not allocate mc_peeledoff_iquv array.'
+        stop 8763
+     endif
+     mc_peeledoff_iquv(:,:,:,:) = 0.d0
+     !
+     write(stdo,*) 'MC variance reduction: peeled-off (next-event) scattering estimator active.'
+     write(stdo,*) '  Spokes from second-order and higher scattering are bypassed by direct'
+     write(stdo,*) '  deposit into the image plane; per-cell mcscat_scatsrc_iquv writes are'
+     write(stdo,*) '  suppressed for those events (deterministic first-scatter is preserved).'
+     call flush(stdo)
+  endif
+  !
   ! If the tausurface mode is on, then allocate some arrays
   !
   if(dotausurf) then
@@ -3957,6 +4070,12 @@ subroutine camera_make_rect_image(img,tausurf)
            ! Set the wavelength for the Monte Carlo scattering simulation
            !
            mc_frequencies(1) = camera_frequencies(inu0)
+           !
+           ! Tell the peel-off estimator which image-side frequency slot
+           ! this MC run writes to (Method 2 = one MC per camera frequency).
+           ! Harmless in flows where peel-off is not active.
+           !
+           if(mc_peeledoff_active) mc_peeledoff_inu_camera = inu0
            !
            ! Message
            !
@@ -4157,6 +4276,32 @@ subroutine camera_make_rect_image(img,tausurf)
      if(allocated(camera_xstop)) deallocate(camera_xstop)
      if(allocated(camera_taustop)) deallocate(camera_taustop)
   endif
+  !
+  ! Peeled-off scattering accumulator: add to image, then deallocate.
+  ! mc_peeledoff_iquv carries the deterministic contributions of each
+  ! 2nd+ order MC scattering event (the per-cell MC binning into
+  ! mcscat_scatsrc_iquv is suppressed when peel-off is active). The
+  ! Stokes channels 2..4 are zero in this initial implementation
+  ! (polarised next-event estimator is a follow-up).
+  !
+  if(mc_peeledoff_active.and.allocated(mc_peeledoff_iquv)) then
+     do inu=1,camera_nrfreq
+        do iy=1,camera_image_ny
+           do ix=1,camera_image_nx
+              camera_rect_image_iquv(ix,iy,inu,1) =                         &
+                   camera_rect_image_iquv(ix,iy,inu,1) +                    &
+                   mc_peeledoff_iquv(ix,iy,inu,1)
+              if(camera_stokesvector) then
+                 camera_rect_image_iquv(ix,iy,inu,2:4) =                    &
+                      camera_rect_image_iquv(ix,iy,inu,2:4) +               &
+                      mc_peeledoff_iquv(ix,iy,inu,2:4)
+              endif
+           enddo
+        enddo
+     enddo
+  endif
+  if(allocated(mc_peeledoff_iquv)) deallocate(mc_peeledoff_iquv)
+  mc_peeledoff_active = .false.
   !
   !--------------------------------------------------------------
   !        A sub-subroutine for making the image
@@ -6999,6 +7144,12 @@ subroutine camera_make_circ_image()
            ! Set the wavelength for the Monte Carlo scattering simulation
            !
            mc_frequencies(1) = camera_frequencies(inu0)
+           !
+           ! Tell the peel-off estimator which image-side frequency slot
+           ! this MC run writes to (Method 2 = one MC per camera frequency).
+           ! Harmless in flows where peel-off is not active.
+           !
+           if(mc_peeledoff_active) mc_peeledoff_inu_camera = inu0
            !
            ! Message
            !
