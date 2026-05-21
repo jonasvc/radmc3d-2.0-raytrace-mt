@@ -3,7 +3,10 @@
 This repository is a fork of **RADMC-3D 2.0** with targeted changes for
 high-resolution synthetic imaging of protoplanetary disks on spherical grids.
 
-The fork is still RADMC-3D. It is not the pipeline repository. The purpose of
+The corresponding pipeline to run it can be found here:
+https://github.com/jonasvc/radmc-simulation-suite
+
+The purpose of
 this codebase is to improve the RADMC-3D Fortran side for the kind of disk
 models where very fine grids, high photon counts, scattering, and multi-core
 ray tracing expose numerical and Monte-Carlo artifacts.
