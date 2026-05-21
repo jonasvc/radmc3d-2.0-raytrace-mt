@@ -32,6 +32,10 @@ the final image.
 This fork addresses those two issues while keeping the normal RADMC-3D workflow
 and file formats intact.
 
+<p align="center">
+  <img src="docs/assets/spoke_reduction.gif" alt="Animation showing radial spoke noise fading into a smoother deterministic source field" width="760">
+</p>
+
 ## The Physics Behind The Spokes
 
 The spoke artifact is not a ray-tracing interpolation feature. It is mostly a
@@ -70,7 +74,7 @@ In simple terms, the noisy cell estimate scales like:
 \frac{1}{\sqrt{N_\mathrm{cell}}}
 ```
 
-where `N_cell` is the number of photon packets that contribute to a given cell.
+where $`N_\mathrm{cell}`$ is the number of photon packets that contribute to a given cell.
 For a model with millions of cells, even very large photon counts can still
 leave only a small number of effective packets per cell.
 
@@ -92,7 +96,7 @@ from random photon packet hits.
 
 For scattered light, the first-scattering source from a central star has the
 same structure: stellar light reaches a cell with an attenuation factor
-`exp[-tau_star]`, scatters with the local albedo and phase function, and then
+$`\exp(-\tau_\star)`$, scatters with the local albedo and phase function, and then
 contributes to the observer direction. Schematically,
 
 ```math
@@ -104,8 +108,8 @@ F_{\nu,\star}\,
 P(\cos \Theta_\mathrm{scat})
 ```
 
-where `omega_nu` is the single-scattering albedo and
-`P(cos Theta_scat)` is the scattering phase function. The fork adds this direct
+where $`\omega_\nu`$ is the single-scattering albedo and
+$`P(\cos\Theta_\mathrm{scat})`$ is the scattering phase function. The fork adds this direct
 first-scattering term deterministically when the geometry supports it.
 
 ## Multi-Threaded Ray Tracing Fixes
@@ -126,6 +130,10 @@ The main fixes are:
 
 The result is a ray tracer that can use multiple cores without the large
 run-to-run intensity differences seen in the uncorrected parallel version.
+
+<p align="center">
+  <img src="docs/assets/thread_safe_raytracing.gif" alt="Animation showing independent OpenMP pixel ray tracing with local buffers and THREADPRIVATE state" width="760">
+</p>
 
 ## Spherical Boundary Robustness
 
@@ -216,7 +224,7 @@ P(\cos \Theta_\mathrm{obs})\,
 \exp(-\tau_\mathrm{obs})
 ```
 
-Here `tau_obs` is the optical depth from the scattering event to the observer.
+Here $`\tau_\mathrm{obs}`$ is the optical depth from the scattering event to the observer.
 Instead of storing that scattered energy in a noisy cell source function and
 later ray-tracing through it, the contribution is added directly to the image
 pixel that sees the event.
@@ -225,6 +233,10 @@ This bypasses the noisy cell-binned scattering source for those events. It is
 more expensive than phi coarsening, but it is better suited to strongly
 asymmetric models where smoothing in phi would erase the structures being
 studied.
+
+<p align="center">
+  <img src="docs/assets/peeled_off_estimator.gif" alt="Animation showing a peeled-off scattering event depositing directly into the image plane" width="760">
+</p>
 
 ## New RADMC Controls
 
