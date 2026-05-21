@@ -64,9 +64,11 @@ each azimuthal wedge is still evaluated separately.
 
 In simple terms, the noisy cell estimate scales like
 
-```text
-relative noise ~ 1 / sqrt(N_cell)
-```
+$$
+\frac{\sigma_\mathrm{cell}}{S_\mathrm{cell}}
+\sim
+\frac{1}{\sqrt{N_\mathrm{cell}}}
+$$
 
 where `N_cell` is the number of photon packets that contribute to a given cell.
 For a model with millions of cells, even very large photon counts can still
@@ -75,9 +77,13 @@ leave only a small number of effective packets per cell.
 For the direct stellar part, the relevant physics is already deterministic: the
 stellar luminosity entering an angular wedge is attenuated radially as
 
-```text
-dL_abs(r, theta, phi) = L_star(theta, phi) * exp[-tau(r)] * d tau
-```
+$$
+\mathrm{d}L_\mathrm{abs}(r,\theta,\phi)
+=
+L_\star(\theta,\phi)
+\exp[-\tau_\star(r,\theta,\phi)]
+\mathrm{d}\tau_\star
+$$
 
 or, equivalently, the local direct stellar heating is proportional to the
 absorbed fraction of the attenuated stellar beam. This fork uses that radial
@@ -89,12 +95,18 @@ same structure: stellar light reaches a cell with an attenuation factor
 `exp[-tau_star]`, scatters with the local albedo and phase function, and then
 contributes to the observer direction. Schematically,
 
-```text
-j_scat ~ F_star * exp[-tau_star] * albedo * P(cos theta_scat)
-```
+$$
+j_\nu^\mathrm{scat}
+\propto
+F_{\nu,\star}\,
+\exp(-\tau_\star)\,
+\omega_\nu\,
+P(\cos \Theta_\mathrm{scat})
+$$
 
-where `P(cos theta_scat)` is the scattering phase function. The fork adds this
-direct first-scattering term deterministically when the geometry supports it.
+where `omega_nu` is the single-scattering albedo and
+`P(cos Theta_scat)` is the scattering phase function. The fork adds this direct
+first-scattering term deterministically when the geometry supports it.
 
 ## Multi-Threaded Ray Tracing Fixes
 
@@ -195,9 +207,14 @@ image plane.
 
 The deposited contribution has the usual next-event form:
 
-```text
-dI_pixel ~ E_packet * albedo * P(cos theta_obs) * exp[-tau_obs]
-```
+$$
+\Delta I_\mathrm{pixel}
+\propto
+E_\mathrm{packet}\,
+\omega_\nu\,
+P(\cos \Theta_\mathrm{obs})\,
+\exp(-\tau_\mathrm{obs})
+$$
 
 Here `tau_obs` is the optical depth from the scattering event to the observer.
 Instead of storing that scattered energy in a noisy cell source function and
