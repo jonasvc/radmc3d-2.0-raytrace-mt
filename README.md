@@ -13,11 +13,6 @@ The two main goals are:
 - make multi-threaded ray tracing reproducible and stable;
 - reduce radial spoke artifacts in thermal and scattered-light disk images.
 
-The detailed technical notes are kept in:
-
-- [`RADMC3D_modifications.md`](RADMC3D_modifications.md)
-- [`1_Multicore_Raytracing.tex`](1_Multicore_Raytracing.tex)
-
 ## Why This Fork Exists
 
 In high-resolution spherical-grid disk models, RADMC-3D can run into two
@@ -157,8 +152,9 @@ Typical choices are:
 | Tight spirals or vortices | low, often `2` to `4` | optional |
 | 2D axisymmetric model | `1` | `0` |
 
-The detailed behavior, activation conditions, and limitations are described in
-[`RADMC3D_modifications.md`](RADMC3D_modifications.md).
+These controls are optional. If they are omitted, the fork keeps behavior close
+to standard RADMC-3D defaults: no phi coarsening and no peeled-off image
+estimator.
 
 ## What Is Not Changed
 
@@ -171,7 +167,7 @@ deterministic direct-source estimators are intended for regular spherical grids
 with a central star. They are not a complete treatment for off-center stars,
 multi-star systems, or arbitrary external illumination.
 
-## Modified Areas
+## Where The Code Changes Are
 
 The main Fortran-side changes are in:
 
@@ -183,7 +179,16 @@ src/amrray_module.f90
 src/sources_module.f90
 ```
 
-The exact implementation details are documented in the modification notes.
+In broad terms:
+
+- `main.f90` reads the new runtime controls;
+- `montecarlo_module.f90` contains the deterministic estimators, stratified
+  photon metadata, scattering-source coarsening, and peeled-off deposits;
+- `camera_module.f90` contains the OpenMP-safe image loops and image-side
+  peeled-off setup/teardown;
+- `amrray_module.f90` contains the spherical boundary robustness fixes;
+- `sources_module.f90` avoids shared scratch state during threaded source
+  calculations.
 
 ## Upstream RADMC-3D
 
