@@ -32,6 +32,86 @@ the final image.
 This fork addresses those two issues while keeping the normal RADMC-3D workflow
 and file formats intact.
 
+<p align="center">
+  <img src="docs/assets/spoke_reduction.gif" alt="Animation showing radial spoke noise fading into a smoother deterministic source field" width="760">
+</p>
+
+## The Physics Behind The Spokes
+
+The spoke artifact is not a ray-tracing interpolation feature. It is mostly a
+Monte-Carlo source-function noise problem that becomes very visible on
+spherical grids.
+
+For a central star, photon packets are launched outward and tend to move along
+quasi-radial paths. During the thermal Monte-Carlo, absorbed stellar energy is
+accumulated in `mc_cumulener`, which later sets the dust temperature. During
+the scattering Monte-Carlo, the scattering source is accumulated in
+`mcscat_scatsrc_iquv`. Both arrays are cell-binned Monte-Carlo estimators.
+
+If only a small number of photon packets contributes to a given `(r, theta,
+phi)` cell, the local source value has normal Poisson noise. On a spherical
+grid that noise is not randomly oriented in the final image: because the photon
+paths from the central star are radial, neighboring noisy cells line up into
+radial bright and dark streaks. The camera then ray-traces through this noisy
+source field and the noise becomes visible as spokes.
+
+The fork reduces this in two physically motivated ways:
+
+- direct central-star heating is replaced by an equivalent deterministic
+  radial attenuation integral where the geometry allows it;
+- direct first scattering from the central star is also added deterministically,
+  while higher-order scattering remains Monte-Carlo.
+
+These estimators are meant to remove sampling noise from contributions whose
+geometry is already known. They do not erase real asymmetric density structure:
+each azimuthal wedge is still evaluated separately.
+
+In simple terms, the noisy cell estimate scales like:
+
+```math
+\frac{\sigma_\mathrm{cell}}{S_\mathrm{cell}}
+\sim
+\frac{1}{\sqrt{N_\mathrm{cell}}}
+```
+
+where $`N_\mathrm{cell}`$ is the number of photon packets that contribute to a given cell.
+For a model with millions of cells, even very large photon counts can still
+leave only a small number of effective packets per cell.
+
+For the direct stellar part, the relevant physics is already deterministic: the
+stellar luminosity entering an angular wedge is attenuated radially as
+
+```math
+\mathrm{d}L_\mathrm{abs}(r,\theta,\phi)
+=
+L_\star(\theta,\phi)\,
+\exp[-\tau_\star(r,\theta,\phi)]\,
+\mathrm{d}\tau_\star
+```
+
+or, equivalently, the local direct stellar heating is proportional to the
+absorbed fraction of the attenuated stellar beam. This fork uses that radial
+attenuation directly instead of estimating the same first-flight contribution
+from random photon packet hits.
+
+For scattered light, the first-scattering source from a central star has the
+same structure: stellar light reaches a cell with an attenuation factor
+$`\exp(-\tau_\star)`$, scatters with the local albedo and phase function, and then
+contributes to the observer direction. Schematically,
+
+```math
+j_\nu^\mathrm{scat}
+\propto
+F_{\nu,\star}\,
+\exp(-\tau_\star)\,
+\omega_\nu\,
+P(\cos \Theta_\mathrm{scat})
+```
+
+where $`\omega_\nu`$ is the single-scattering albedo and
+$`P(\cos\Theta_\mathrm{scat})`$ is the scattering phase function. The fork adds this direct
+first-scattering term deterministically when the geometry supports it.
+
 ## Multi-Threaded Ray Tracing Fixes
 
 The ray-tracing loops for rectangular and circular images are parallelized with
@@ -43,12 +123,17 @@ The main fixes are:
 
 - each thread uses its own local intensity buffer for the pixel it is tracing;
 - global diagnostic counters are updated atomically;
-- stellar-sphere state is made thread-private;
+- stellar-sphere and per-photon Monte-Carlo state that must differ between
+  threads is marked with OpenMP `THREADPRIVATE`;
 - dust source-function scratch arrays are local to each call instead of shared;
 - pixel loops are distributed with OpenMP while avoiding unsafe diagnostic I/O.
 
 The result is a ray tracer that can use multiple cores without the large
 run-to-run intensity differences seen in the uncorrected parallel version.
+
+<p align="center">
+  <img src="docs/assets/thread_safe_raytracing.gif" alt="Animation showing independent OpenMP pixel ray tracing with local buffers and THREADPRIVATE state" width="760">
+</p>
 
 ## Spherical Boundary Robustness
 
@@ -71,10 +156,13 @@ heating contribution can be computed deterministically along radial rays. This
 fork uses that fact to remove the dominant phi-correlated Monte-Carlo noise in
 the thermal dust temperature field.
 
-The key point is that this does not force the model to be axisymmetric. Each
-azimuthal wedge is still treated independently, so genuine asymmetric density
-structure remains visible. Only the random direct-stellar sampling noise is
-replaced by the deterministic equivalent.
+The deterministic heating estimator follows the stellar luminosity through each
+angular wedge and attenuates it with the local optical depth. The remaining
+thermal processes still use the normal RADMC-3D machinery. The key point is
+that this does not force the model to be axisymmetric. Each azimuthal wedge is
+still treated independently, so genuine asymmetric density structure remains
+visible. Only the random direct-stellar sampling noise is replaced by the
+deterministic equivalent.
 
 This mainly improves `noscat` or thermal-dominated images where spokes were
 caused by noisy `mc_cumulener` deposition during the thermal Monte-Carlo.
@@ -125,10 +213,30 @@ images. At each scattering event, the code sends a deterministic test ray
 toward the observer and deposits the attenuated contribution directly into the
 image plane.
 
+The deposited contribution has the usual next-event form:
+
+```math
+\Delta I_\mathrm{pixel}
+\propto
+E_\mathrm{packet}\,
+\omega_\nu\,
+P(\cos \Theta_\mathrm{obs})\,
+\exp(-\tau_\mathrm{obs})
+```
+
+Here $`\tau_\mathrm{obs}`$ is the optical depth from the scattering event to the observer.
+Instead of storing that scattered energy in a noisy cell source function and
+later ray-tracing through it, the contribution is added directly to the image
+pixel that sees the event.
+
 This bypasses the noisy cell-binned scattering source for those events. It is
 more expensive than phi coarsening, but it is better suited to strongly
 asymmetric models where smoothing in phi would erase the structures being
 studied.
+
+<p align="center">
+  <img src="docs/assets/peeled_off_estimator.gif" alt="Animation showing a peeled-off scattering event depositing directly into the image plane" width="760">
+</p>
 
 ## New RADMC Controls
 
