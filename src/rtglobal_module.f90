@@ -74,6 +74,7 @@ module rtglobal_module
      integer :: debug_write_path            ! =1 Write the path of the photon
   !   integer :: debug_write_eventcounts     ! =1 Write for each photon nr of events
      integer :: countwrite                  ! Each countwrite, write to standard output
+     integer :: mctherm_diagnostics         ! >0 Print completed-photon/MRW diagnostics
   !   integer :: incl_scatsrc_mctherm        ! Do we make scattering src while doing therm MC?
      logical :: optimized_motion            ! For high optical deth cells
      double precision :: optim_dtau         ! For high optical deth cells
@@ -1609,4 +1610,3 @@ end subroutine write_vectorfield
 
 
 end module rtglobal_module
-

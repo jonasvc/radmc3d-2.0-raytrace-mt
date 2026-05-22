@@ -214,6 +214,7 @@ program radmc3d
   rt_mcparams%debug_write_path = 0
 !!  rt_mcparams%debug_write_eventcounts = 0
   rt_mcparams%countwrite       = 1000
+  rt_mcparams%mctherm_diagnostics = 0
   rt_mcparams%ivstrt           = 1       ! Dust species 1 used for vert struct
   rt_mcparams%vserrtol         = 0.d0
   rt_mcparams%niter_vstruct    = 0
@@ -2281,6 +2282,7 @@ subroutine read_radmcinp_file()
      call parse_input_double ('temp0@                        ',rt_mcparams%temp0)
      call parse_input_double ('temp1@                        ',rt_mcparams%temp1)
      call parse_input_integer('countwrite@                   ',rt_mcparams%countwrite)
+     call parse_input_integer('mctherm_diagnostics@          ',rt_mcparams%mctherm_diagnostics)
      call parse_input_integer('camera_tracemode@             ',camera_tracemode)
      idum=-1
      call parse_input_integer('writeimage_unformatted@       ',idum)
@@ -2537,7 +2539,7 @@ subroutine interpet_command_line_options(gotit,fromstdi,quit)
   use constants_module
   use userdef_module
   implicit none
-  character*100 :: buffer
+  character*100 :: buffer,optval
   integer :: iarg,numarg
   double precision :: dum,zoom_x0,zoom_x1,zoom_y0,zoom_y1,px,py
   integer :: idum
@@ -2634,6 +2636,42 @@ subroutine interpet_command_line_options(gotit,fromstdi,quit)
         gotit = .true.
      elseif(buffer(1:7).eq.'usetree') then
         amr_always_use_tree = .true.
+        gotit = .true.
+     elseif(buffer(1:19).eq.'mctherm_diagnostics') then
+        !
+        ! Enable compact thermal Monte Carlo diagnostics.
+        ! Keep this before the mctherm action, because the option name starts with mctherm.
+        !
+        if(index(buffer,'=').gt.0) then
+           optval = adjustl(buffer(index(buffer,'=')+1:))
+           if(len_trim(optval).eq.0) then
+              if(iarg.gt.numarg) then
+                 write(stdo,*) 'ERROR while reading command line options: cannot read mctherm_diagnostics.'
+                 write(stdo,*) '      Expecting 1 integer after mctherm_diagnostics.'
+                 stop
+              endif
+              call ggetarg(iarg,optval,fromstdi)
+              iarg = iarg+1
+           endif
+        else
+           if(iarg.gt.numarg) then
+              write(stdo,*) 'ERROR while reading command line options: cannot read mctherm_diagnostics.'
+              write(stdo,*) '      Expecting 1 integer after mctherm_diagnostics.'
+              stop
+           endif
+           call ggetarg(iarg,optval,fromstdi)
+           iarg = iarg+1
+           if(optval(1:1).eq.'=') then
+              if(iarg.gt.numarg) then
+                 write(stdo,*) 'ERROR while reading command line options: cannot read mctherm_diagnostics.'
+                 write(stdo,*) '      Expecting 1 integer after mctherm_diagnostics.'
+                 stop
+              endif
+              call ggetarg(iarg,optval,fromstdi)
+              iarg = iarg+1
+           endif
+        endif
+        read(optval,*) rt_mcparams%mctherm_diagnostics
         gotit = .true.
      elseif(buffer(1:7).eq.'mctherm') then
         !
@@ -4036,5 +4074,3 @@ subroutine write_message_rad_processes()
   endif
   call flush(stdo)     
 end subroutine write_message_rad_processes
-
-

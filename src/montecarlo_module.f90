@@ -60,6 +60,21 @@ logical :: mc_openmp_parallel = .false.
 integer(kind=8) :: ieventcounttot
 double precision :: mc_visitcell,mc_revisitcell,mc_revisitcell_max
 !
+! Optional thermal Monte Carlo diagnostics. These are reset for each mctherm
+! run and only updated when params%mctherm_diagnostics is enabled.
+!
+integer(kind=8) :: mc_mctherm_diag_completed
+integer(kind=8) :: mc_mctherm_diag_max_events
+integer(kind=8) :: mc_mctherm_diag_abs_events
+integer(kind=8) :: mc_mctherm_diag_temp_recomputes
+integer(kind=8) :: mc_mctherm_diag_abs_lock_attempts
+integer(kind=8) :: mc_mctherm_diag_abs_lock_conflicts
+integer(kind=8) :: mc_mctherm_diag_mrw_attempts
+integer(kind=8) :: mc_mctherm_diag_mrw_successes
+integer(kind=8) :: mc_mctherm_diag_mrw_lock_conflicts
+integer(kind=8) :: mc_mctherm_diag_photon_events
+double precision :: mc_mctherm_diag_mrw_synth_events
+!
 ! Counter for photon-out-of-cell errors
 !
 integer :: mc_photon_out_of_cell_count = 0
@@ -351,6 +366,7 @@ integer :: selectscat_iscat_last  = 1000000000
 !$OMP THREADPRIVATE(mc_scat_iphot_strat, mc_scat_nphot_strat, mc_scat_strat_tau)
 !$OMP THREADPRIVATE(mc_scat_skip_first_stellar_scatsrc)
 !$OMP THREADPRIVATE(mc_therm_skip_first_stellar_heating)
+!$OMP THREADPRIVATE(mc_mctherm_diag_photon_events)
 !$OMP THREADPRIVATE(enercum)
 !$OMP THREADPRIVATE(alpha_t_rm,alpha_a_pm_tot)
 !$OMP THREADPRIVATE(alpha_a_pm,mrw_dcumen)
@@ -2280,6 +2296,7 @@ subroutine do_monte_carlo_bjorkmanwood(params,ierror,resetseed)
   integer :: ierror,ierrpriv,countwrite,index,illum
   integer :: inu,ispec,istar,icell,nsrc,nstarsrc
   integer*8 :: iphot,ipstart,nphot,cnt,cntdump
+  integer*8 :: eventcount_photon
   integer :: iseeddum,isd,itemplate
   logical :: mc_emergency_break
   !$ integer :: i
@@ -2330,6 +2347,16 @@ subroutine do_monte_carlo_bjorkmanwood(params,ierror,resetseed)
   mc_visitcell = 0
   mc_revisitcell = 0
   mc_revisitcell_max = 0
+  mc_mctherm_diag_completed = 0_8
+  mc_mctherm_diag_max_events = 0_8
+  mc_mctherm_diag_abs_events = 0_8
+  mc_mctherm_diag_temp_recomputes = 0_8
+  mc_mctherm_diag_abs_lock_attempts = 0_8
+  mc_mctherm_diag_abs_lock_conflicts = 0_8
+  mc_mctherm_diag_mrw_attempts = 0_8
+  mc_mctherm_diag_mrw_successes = 0_8
+  mc_mctherm_diag_mrw_lock_conflicts = 0_8
+  mc_mctherm_diag_mrw_synth_events = 0.d0
   !
   ! If write statistics, then open this file
   !
@@ -2578,6 +2605,10 @@ subroutine do_monte_carlo_bjorkmanwood(params,ierror,resetseed)
   else
      write(stdo,*) 'Modified Random Walk mode is switched OFF'
   endif
+  if(params%mctherm_diagnostics.ne.0) then
+     write(stdo,*) 'Thermal Monte Carlo diagnostics are switched ON'
+     write(stdo,*) '  End-of-run event, MRW, and lock counters will be printed.'
+  endif
   write(stdo,*) ' '
   write(stdo,*) 'Starting the thermal Monte Carlo simulation....'
   call flush(stdo)
@@ -2666,7 +2697,7 @@ subroutine do_monte_carlo_bjorkmanwood(params,ierror,resetseed)
    !
    !!$ Local variables from 'do_monte_carlo_bjorkmanwood'
    !
-   !$OMP PRIVATE(ierrpriv) &
+   !$OMP PRIVATE(ierrpriv,eventcount_photon) &
    !
    !!$ Global variables from other modules used in the subroutine 'do_monte_carlo_bjorkmanwood'
    !!$ or in other subroutine calls within the parallel section
@@ -2676,13 +2707,22 @@ subroutine do_monte_carlo_bjorkmanwood(params,ierror,resetseed)
    !!$ location of the considered variable.
    !
    !$OMP REDUCTION(+:mc_integerspec,mc_visitcell,mc_revisitcell,ieventcounttot) &
-   !$OMP REDUCTION(max:mc_revisitcell_max)
+   !$OMP REDUCTION(+:mc_mctherm_diag_completed,mc_mctherm_diag_abs_events) &
+   !$OMP REDUCTION(+:mc_mctherm_diag_temp_recomputes) &
+   !$OMP REDUCTION(+:mc_mctherm_diag_abs_lock_attempts) &
+   !$OMP REDUCTION(+:mc_mctherm_diag_abs_lock_conflicts) &
+   !$OMP REDUCTION(+:mc_mctherm_diag_mrw_attempts) &
+   !$OMP REDUCTION(+:mc_mctherm_diag_mrw_successes) &
+   !$OMP REDUCTION(+:mc_mctherm_diag_mrw_lock_conflicts) &
+   !$OMP REDUCTION(+:mc_mctherm_diag_mrw_synth_events) &
+   !$OMP REDUCTION(max:mc_revisitcell_max) &
+   !$OMP REDUCTION(max:mc_mctherm_diag_max_events)
    !
    !$ id=OMP_get_thread_num()
    !$ nthreads=OMP_get_num_threads()
    !$ write(stdo,*) 'Thread Nr',id,'of',nthreads,'threads in total'
    !$ iseed=-abs(iseed_start+id)
-   !$OMP DO SCHEDULE(dynamic)
+   !$OMP DO SCHEDULE(dynamic,64)
    !
    ! Launch all the photons
    !
@@ -2721,7 +2761,15 @@ subroutine do_monte_carlo_bjorkmanwood(params,ierror,resetseed)
          ! Call the walk routine
          !
          !!$ Some critical sections are hidden within this subroutine call
+         if(params%mctherm_diagnostics.ne.0) then
+            mc_mctherm_diag_photon_events = 0_8
+         endif
          call walk_full_path_bjorkmanwood(params,ierrpriv)
+         if(params%mctherm_diagnostics.ne.0) then
+            eventcount_photon = mc_mctherm_diag_photon_events
+            mc_mctherm_diag_completed = mc_mctherm_diag_completed + 1_8
+            mc_mctherm_diag_max_events = max(mc_mctherm_diag_max_events,eventcount_photon)
+         endif
          !       
          ! If ierrpriv.ne.0 then an error occurred. This is rare, so continue
          ! but increase the error counter.
@@ -2761,6 +2809,29 @@ subroutine do_monte_carlo_bjorkmanwood(params,ierror,resetseed)
    !!$ open(file='speed_Up_Lock_Thermal',unit=200,position='append')
    !!$ write(200,*)nthreads,"'",omp_get_wtime() - seconds;
    !!$ close(200)
+   if(params%mctherm_diagnostics.ne.0) then
+      write(stdo,*) 'Thermal Monte Carlo diagnostics:'
+      write(stdo,*) '  Completed photon packages       = ',mc_mctherm_diag_completed
+      write(stdo,*) '  Total abs/scat events           = ',ieventcounttot
+      if(mc_mctherm_diag_completed.gt.0_8) then
+         write(stdo,*) '  Average events per completed photon = ', &
+              dble(ieventcounttot)/dble(mc_mctherm_diag_completed)
+      endif
+      write(stdo,*) '  Maximum events in one photon    = ',mc_mctherm_diag_max_events
+      write(stdo,*) '  Absorption events               = ',mc_mctherm_diag_abs_events
+      write(stdo,*) '  Temperature recomputes          = ',mc_mctherm_diag_temp_recomputes
+      write(stdo,*) '  Absorption lock attempts        = ',mc_mctherm_diag_abs_lock_attempts
+      write(stdo,*) '  Absorption lock conflicts       = ',mc_mctherm_diag_abs_lock_conflicts
+      write(stdo,*) '  MRW candidate entries           = ',mc_mctherm_diag_mrw_attempts
+      write(stdo,*) '  MRW accepted walks              = ',mc_mctherm_diag_mrw_successes
+      write(stdo,*) '  MRW lock conflicts              = ',mc_mctherm_diag_mrw_lock_conflicts
+      write(stdo,*) '  MRW internal event sum          = ',mc_mctherm_diag_mrw_synth_events
+      if(mc_mctherm_diag_mrw_successes.gt.0_8) then
+         write(stdo,*) '  Average internal events per MRW = ', &
+              mc_mctherm_diag_mrw_synth_events/dble(mc_mctherm_diag_mrw_successes)
+      endif
+      call flush(stdo)
+   endif
    
    if(mc_emergency_break) then
       return
@@ -3304,7 +3375,7 @@ subroutine do_monte_carlo_scattering(params,ierror,resetseed,scatsrc,meanint)
      !$ nthreads=OMP_get_num_threads()
      !$ write(stdo,*) 'Thread Nr',id,'of',nthreads,'threads in total'
      !$ iseed=-abs(iseed_start+id)
-     !$OMP DO SCHEDULE(dynamic)
+     !$OMP DO SCHEDULE(dynamic,64)
      !
      ! Launch all the photons for this wavelength
      !
@@ -6032,6 +6103,9 @@ subroutine walk_full_path_bjorkmanwood(params,ierror)
      ! For debugging: Increase event counter
      !
      ieventcounttot = ieventcounttot + 1
+     if(params%mctherm_diagnostics.ne.0) then
+        mc_mctherm_diag_photon_events = mc_mctherm_diag_photon_events + 1_8
+     endif
      !
      ! If requested, see if we can do a Modified Random Walk (MRW) from
      ! this point onward until we exit the cell again. This is 
@@ -6070,6 +6144,9 @@ subroutine walk_full_path_bjorkmanwood(params,ierror)
            !
            if((count_samecell.ge.params%mrw_count_trigger).or. &
                 mrw_cell_uses_mrw(ray_index)) then
+              if(params%mctherm_diagnostics.ne.0) then
+                 mc_mctherm_diag_mrw_attempts = mc_mctherm_diag_mrw_attempts + 1_8
+              endif
               !
               ! OpenMP: Lock this cell
               !
@@ -6078,6 +6155,9 @@ subroutine walk_full_path_bjorkmanwood(params,ierror)
               !$    if(continue)then
               !$omp atomic
               !$       conflict_counter=conflict_counter+1
+              !$       if(params%mctherm_diagnostics.ne.0) then
+              !$          mc_mctherm_diag_mrw_lock_conflicts = mc_mctherm_diag_mrw_lock_conflicts + 1_8
+              !$       endif
               !$       continue=.false.
               !$    end if
               !$ end do
@@ -6274,6 +6354,9 @@ subroutine walk_full_path_bjorkmanwood(params,ierror)
                  ! If inside of cell, then do MRW, otherwise jiggle the photon position a bit
                  !
                  if(incell) then
+                    if(params%mctherm_diagnostics.ne.0) then
+                       mc_mctherm_diag_mrw_successes = mc_mctherm_diag_mrw_successes + 1_8
+                    endif
                     !
                     ! ...yes we are inside the cell, so let's go 
                     !
@@ -6281,6 +6364,10 @@ subroutine walk_full_path_bjorkmanwood(params,ierror)
                                    enthres,alpha_a_pm_tot,alpha_t_rm,params%mrw_gamma,   &
                                    icoord,idim,idir_cross,ilr_cross,nrevents,            &
                                    taumargin=params%mrw_taustepback)
+                    if(params%mctherm_diagnostics.ne.0) then
+                       mc_mctherm_diag_mrw_synth_events = &
+                            mc_mctherm_diag_mrw_synth_events + nrevents
+                    endif
                     ! 
                     ! Calculate the dust temperature one last time
                     !
@@ -7303,7 +7390,7 @@ subroutine walk_cells_thermal(params,taupath,iqactive,arrived, &
      endif
      !
      ! Path length
-     ! 
+     !
      ! ######### CHECK: WHY NOT USE ray_ds ??? ########
      !
      ds   = sqrt( (ray_cart_x-prev_x)**2 + (ray_cart_y-prev_y)**2 + (ray_cart_z-prev_z)**2 )
@@ -7552,7 +7639,7 @@ subroutine walk_cells_scat(params,taupath,ener,inu,arrived,ispecc,ierror)
   doubleprecision :: taupath,fr,ener,enerav
   doubleprecision :: tau,dtau,dum,dtauabs,dtauscat,xptauabs,xxtauabs
   doubleprecision :: ds,rn,scatsrc0,mnint,dss
-  logical :: ok,arrived,skip_stellar_direct_scatsrc
+  logical :: ok,arrived,skip_stellar_direct_scatsrc,use_cell_lock
   doubleprecision :: prev_x,prev_y,prev_z
   doubleprecision :: costheta,g,phasefunc,dummy,src4(1:4)
   doubleprecision :: axi(1:2,1:3),Ebk,Qbk,Ubk,Vbk
@@ -7574,6 +7661,9 @@ subroutine walk_cells_scat(params,taupath,ener,inu,arrived,ispecc,ierror)
   ray_inu  = inu
   skip_stellar_direct_scatsrc = mc_scat_direct_stellar_scatsrc.and.      &
        mc_scat_skip_first_stellar_scatsrc.and.(selectscat_iscat.eq.1)
+  ! For isotropic scattering the shared tallies are scalar additions below,
+  ! so atomics are cheaper than holding the cell lock around the full ray step.
+  use_cell_lock = (params%debug_write_stats.ne.0).or.(scattering_mode.ne.1)
   !
   ! In this subroutine we will not make use of the amrray option to
   ! advance only partly within a cell. We will check here if we have
@@ -7636,7 +7726,7 @@ subroutine walk_cells_scat(params,taupath,ener,inu,arrived,ispecc,ierror)
      ! OpenMP Parallellization: Lock this cell (and only continue when succesfully locked)
      !
      !$ continue=.true.
-     !$ if(ray_index .gt. 0)then
+     !$ if(use_cell_lock.and.(ray_index .gt. 0))then
      !$    do while(.NOT. omp_test_lock(lock(ray_index)))
      !$       if(continue)then
      !$omp atomic
@@ -7769,14 +7859,14 @@ subroutine walk_cells_scat(params,taupath,ener,inu,arrived,ispecc,ierror)
         !
         ! OpenMP Parallellization: Release lock on this cell
         !
-        !$ if(ray_index .ge. 1 )then
+        !$ if(use_cell_lock.and.(ray_index .ge. 1))then
         !$    call omp_unset_lock(lock(ray_index));
         !$ endif
         return
      endif
      !
      ! Path length
-     ! 
+     !
      ! ######### CHECK: WHY NOT USE ray_ds ??? ########
      !
      ds   = sqrt( (ray_cart_x-prev_x)**2 + (ray_cart_y-prev_y)**2 + (ray_cart_z-prev_z)**2 )
@@ -7871,8 +7961,9 @@ subroutine walk_cells_scat(params,taupath,ener,inu,arrived,ispecc,ierror)
               ! Isotropic scattering: simply add the source term
               !
               scatsrc0 = dtauscat * enerav / ( cellvolume(ray_index) * 12.566371d0 )
+              !$OMP ATOMIC
               mcscat_scatsrc_iquv(ray_inu,ray_index,1,1) =                            &
-                      mcscat_scatsrc_iquv(ray_inu,ray_index,1,1) + scatsrc0
+                   mcscat_scatsrc_iquv(ray_inu,ray_index,1,1) + scatsrc0
            elseif((scattering_mode.eq.2).or.(scattering_mode.eq.3)) then
               !
               ! 2D scattering mode only for scattering_mode 5
@@ -8154,8 +8245,14 @@ subroutine walk_cells_scat(params,taupath,ener,inu,arrived,ispecc,ierror)
            if(dtauscat.lt.0.d0) stop 488       ! Trivial test (can be removed)
            dss   = dtauscat / alpha_s_tot
            mnint = dss * enerav / ( cellvolume(ray_index) * 12.566371d0 )
-           mcscat_meanint(ray_inu,ray_index) =                            &
-                mcscat_meanint(ray_inu,ray_index) + mnint
+           if(scattering_mode.eq.1) then
+              !$OMP ATOMIC
+              mcscat_meanint(ray_inu,ray_index) =                         &
+                   mcscat_meanint(ray_inu,ray_index) + mnint
+           else
+              mcscat_meanint(ray_inu,ray_index) =                         &
+                   mcscat_meanint(ray_inu,ray_index) + mnint
+           endif
         endif
         endif ! This endif is for the selectscat analysis stuff (normally not important)
         !
@@ -8234,7 +8331,7 @@ subroutine walk_cells_scat(params,taupath,ener,inu,arrived,ispecc,ierror)
         !
         ! OpenMP Parallellization: Release lock on this cell
         !
-        !$ if(ray_index .ge. 1 )then
+        !$ if(use_cell_lock.and.(ray_index .ge. 1))then
         !$    call omp_unset_lock(lock(ray_index));
         !$ endif
         return
@@ -8291,8 +8388,9 @@ subroutine walk_cells_scat(params,taupath,ener,inu,arrived,ispecc,ierror)
               ! Isotropic scattering: simply add the source term
               !
               scatsrc0 = dtau * enerav / ( cellvolume(ray_index) * 12.566371d0 )
+              !$OMP ATOMIC
               mcscat_scatsrc_iquv(ray_inu,ray_index,1,1) =                            &
-                      mcscat_scatsrc_iquv(ray_inu,ray_index,1,1) + scatsrc0
+                   mcscat_scatsrc_iquv(ray_inu,ray_index,1,1) + scatsrc0
            elseif((scattering_mode.eq.2).or.(scattering_mode.eq.3)) then
               !
               ! Anisotropic scattering: add only for the given directions
@@ -8533,8 +8631,14 @@ subroutine walk_cells_scat(params,taupath,ener,inu,arrived,ispecc,ierror)
         !
         if(allocated(mcscat_meanint)) then
            mnint = ds * enerav / ( cellvolume(ray_index) * 12.566371d0 )
-           mcscat_meanint(ray_inu,ray_index) =                            &
-                mcscat_meanint(ray_inu,ray_index) + mnint
+           if(scattering_mode.eq.1) then
+              !$OMP ATOMIC
+              mcscat_meanint(ray_inu,ray_index) =                         &
+                   mcscat_meanint(ray_inu,ray_index) + mnint
+           else
+              mcscat_meanint(ray_inu,ray_index) =                         &
+                   mcscat_meanint(ray_inu,ray_index) + mnint
+           endif
         endif
         endif ! This endif is for the selectscat analysis stuff (normally not important)
         !
@@ -8568,7 +8672,7 @@ subroutine walk_cells_scat(params,taupath,ener,inu,arrived,ispecc,ierror)
      !
      ! OpenMP Parallellization: Release lock on this cell
      !
-     !$ if(ray_index .ge. 1 )then
+     !$ if(use_cell_lock.and.(ray_index .ge. 1))then
      !$    call omp_unset_lock(lock(ray_index));
      !$ endif
      !
@@ -8769,7 +8873,7 @@ subroutine walk_cells_optical_depth(params,lenpath,inu,tau)
      if(ierror.ne.0) return
      !
      ! Path length
-     ! 
+     !
      ! ######### CHECK: WHY NOT USE ray_ds ??? ########
      !
      ds   = sqrt( (ray_cart_x-prev_x)**2 + (ray_cart_y-prev_y)**2 + (ray_cart_z-prev_z)**2 )
@@ -8930,12 +9034,16 @@ subroutine do_absorption_event(params,iqactive,ierror)
   doubleprecision :: cumen,tempav,rn,fracquant,alpha_a_nu
   doubleprecision :: dum,dum1,dum2,rhodusttot,entotal
   logical :: calctemp
+  !$ logical :: diag_waited
   !
   if(freq_dnu(1).eq.0.d0) stop 32222
   !
   ! Default
   !
   mc_photon_destroyed = .false.
+  if(params%mctherm_diagnostics.ne.0) then
+     mc_mctherm_diag_abs_events = mc_mctherm_diag_abs_events + 1_8
+  endif
   !
   ! First determine how the energy is going to be divided over
   ! the dust species and sizes
@@ -9086,17 +9194,28 @@ subroutine do_absorption_event(params,iqactive,ierror)
   ! (this need not be hugely accurate)
   !
   if(calctemp) then
+     if(params%mctherm_diagnostics.ne.0) then
+        mc_mctherm_diag_temp_recomputes = mc_mctherm_diag_temp_recomputes + 1_8
+     endif
      !
      ! OpenMP Parallellization: Lock this cell (and only continue when succesfully locked)
      !
      !$ if(ray_index .gt. 0)then
+     !$ if(params%mctherm_diagnostics.ne.0) then
+     !$    mc_mctherm_diag_abs_lock_attempts = mc_mctherm_diag_abs_lock_attempts + 1_8
+     !$ endif
+     !$ diag_waited=.false.
      !!$ continue=.true.
      !$ do while(.NOT. omp_test_lock(lock(ray_index)))
+     !$    diag_waited=.true.
      !!$ if(continue)then
      !!$ conflict_counter=conflict_counter+1
      !!$ continue=.false.
      !!$ end if
      !$ end do
+     !$ if(params%mctherm_diagnostics.ne.0.and.diag_waited) then
+     !$    mc_mctherm_diag_abs_lock_conflicts = mc_mctherm_diag_abs_lock_conflicts + 1_8
+     !$ endif
      !$ end if
      !
      if(params%itempdecoup.eq.1) then
@@ -11530,6 +11649,7 @@ subroutine modified_random_walk(cellx0,cellx1,pos,dir,energy,enerphot,     &
   l_freeross = 1.d0 / alpha_ross
   idir_cross = 0
   ilr_cross  = 0
+  nrevents   = 0.d0
   if(present(taumargin)) then
      ds_margin = taumargin * l_freeross
   else
